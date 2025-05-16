@@ -1,0 +1,14 @@
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\bin\Debug\net8.0\ProjectDumper.exe
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\bin\Debug\net8.0\ProjectDumper.deps.json
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\bin\Debug\net8.0\ProjectDumper.runtimeconfig.json
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\bin\Debug\net8.0\ProjectDumper.dll
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\bin\Debug\net8.0\ProjectDumper.pdb
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ProjectDumper.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ProjectDumper.AssemblyInfoInputs.cache
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ProjectDumper.AssemblyInfo.cs
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ProjectDumper.csproj.CoreCompileInputs.cache
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ProjectDumper.dll
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\refint\ProjectDumper.dll
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ProjectDumper.pdb
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ProjectDumper.genruntimeconfig.cache
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ref\ProjectDumper.dll
