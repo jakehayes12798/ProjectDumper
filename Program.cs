@@ -7,8 +7,27 @@ class Program
 {
     static void Main(string[] args)
     {
+        
+        if (args.Length < 1)
+        {
+            Console.WriteLine("Usage: ProjectFileDumper <project-directory> [output-file]");
+            return;
+        }
+
         string projectDir = args[0];
-        string outputFile = "ProjectDump.txt";
+
+        string outputFile;
+
+        if (args.Length > 1 && !string.IsNullOrWhiteSpace(args[1]))
+        {
+            outputFile = args[1];
+        }
+        else
+        {
+            // Use the directory name as the output file name
+            string dirName = Path.GetFileName(projectDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            outputFile = dirName + ".txt";
+        }
 
         var includeFolders = new List<string> { }; // Optional: folders to include
         var excludeFolders = new List<string> { }; // Optional: folders to skip

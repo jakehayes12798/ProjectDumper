@@ -12,3 +12,4 @@ C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\refint
 C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ProjectDumper.pdb
 C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ProjectDumper.genruntimeconfig.cache
 C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ref\ProjectDumper.dll
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\obj\Debug\net8.0\ProjectDumper.sourcelink.json
