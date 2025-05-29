@@ -1,0 +1,5020 @@
+// File: Program.cs
+/*
+ * CalliAPI 'Program.cs'
+ * 2025 Mar 28
+ * Jacob Hayes
+ * Creates the services and clients that CalliAPI needs to function and passes them to the MainForm.
+ */
+
+using AmourgisCOREServices;
+using CalliAPI.BusinessLogic;
+using CalliAPI.DataAccess;
+using CalliAPI.UI;
+using DocumentFormat.OpenXml.Drawing.Charts;
+using Microsoft.Win32;
+using Serilog.Core;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using Velopack; // for auto-updates
+using Velopack.Windows; // for auto-updates
+
+namespace CalliAPI
+{
+    public static class Program
+    {
+
+
+        /// <summary>
+        /// AllocConsole is a Windows API function that allocates a new console for the calling process.
+        /// </summary>
+        /// <returns></returns>
+        [DllImport("kernel32.dll")]
+        private static extern bool AllocConsole();
+
+
+
+        /// <summary>
+        ///  The main entry point for the application.
+        /// </summary>
+        [STAThread]
+        static void Main(string[] args)
+        {
+            VelopackApp.Build().Run(); // <--- must be first line of code in Main!
+            // ^ Checks for Updates with Velopack (formerly Squirrel.Clowd, formerly Squirrel.Windows)
+
+            AMO_Logger _logger = new AMO_Logger("CalliAPI");
+            _logger.Info("CalliAPI started");
+
+
+
+            // Open a console window for debugging purposes
+            AllocConsole();
+
+
+
+            // Redirect Console output to the new console window to allow Serilog's Console sink to work
+            StreamWriter standardOutput = new StreamWriter(Console.OpenStandardOutput())
+            {
+                AutoFlush = true
+            };
+            Console.SetOut(standardOutput);
+            Console.SetError(standardOutput);
+
+
+            // To customize application configuration such as set high DPI settings or default font,
+            // see https://aka.ms/applicationconfiguration.
+            ApplicationConfiguration.Initialize();
+
+            // Create the Services we need through Dependency Injection - 2025-04-21
+            HttpClient httpClient = new HttpClient();
+            ClioApiClient clioApiClient = new ClioApiClient(httpClient, logger: _logger);
+            AuthService authService = new AuthService(clioApiClient, logger: _logger);
+            ClioService clioService = new ClioService(clioApiClient, authService, logger: _logger);
+            _logger.Info("Services created");
+
+            string clientSecret = LoadClientSecretFromRegistry();
+            if (string.IsNullOrWhiteSpace(clientSecret))
+            {
+                using (var secretForm = new SecretGatekeeper())
+                {
+                    if (secretForm.ShowDialog() == DialogResult.OK)
+                    {
+                        SaveClientSecretToRegistry(secretForm.ClientSecret);
+                        clientSecret = secretForm.ClientSecret;
+                    }
+                    else
+                    {
+                        MessageBox.Show("You must enter a CLIO_CLIENT_SECRET to continue.", "Missing Secret", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        Environment.Exit(1);
+                    }
+                }
+            }
+
+            // Create the MainForm and pass the services to it
+            Application.Run(new MainForm(clioService: clioService, logger: _logger));
+        }
+
+
+        public static void SaveClientSecretToRegistry(string secret)
+        {
+            RegistryKey key = Registry.CurrentUser.CreateSubKey(@"SOFTWARE\CalliAPI");
+            key.SetValue("ClioClientSecret", secret);
+            key.Close();
+        }
+
+        public static string LoadClientSecretFromRegistry()
+        {
+            RegistryKey key = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\CalliAPI");
+            return key?.GetValue("ClioClientSecret") as string;
+        }
+
+    }
+}
+
+// File: BusinessLogic\AuthService.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using CalliAPI.Interfaces;
+using CalliAPI.Properties;
+using CalliAPI;
+using AmourgisCOREServices;
+using CalliAPI.DataAccess;
+using System.Security.Cryptography;
+
+namespace CalliAPI.BusinessLogic
+{
+    public class AuthService : IAuthService
+    {
+        private readonly AMO_Logger _logger;
+
+        private readonly ClioApiClient _clioApiClient;
+        public string AccessToken { get; private set; }
+
+        private string _codeVerifier;
+        private string _codeChallenge;
+
+
+        public AuthService(ClioApiClient clioApiAccess, AMO_Logger logger)
+        {
+            _clioApiClient = clioApiAccess;
+            _logger = logger;
+        }
+
+
+        /// <summary>
+        /// Generates PKCE (Proof Key for Code Exchange) values. Useful if we can use PKCE for OAuth 2.0 authorization.
+        /// </summary>
+        private void GeneratePkceValues()
+        {
+            using var rng = RandomNumberGenerator.Create();
+            var bytes = new byte[32];
+            rng.GetBytes(bytes);
+            _codeVerifier = Convert.ToBase64String(bytes)
+                .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+            using var sha256 = SHA256.Create();
+            var challengeBytes = sha256.ComputeHash(Encoding.ASCII.GetBytes(_codeVerifier));
+            _codeChallenge = Convert.ToBase64String(challengeBytes)
+                .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        }
+
+
+
+
+        public string GetAuthorizationUrl()
+        {
+            // Return the authorization URL
+            return $"https://app.clio.com/oauth/authorize?response_type=code&" +
+                $"client_id={Properties.Settings.Default.ClientId}&" +
+                $"redirect_uri={Properties.Settings.Default.RedirectUri}";
+        }
+
+
+
+        public string ValidateAuthorizationCode(string userInput)
+        {
+            if (string.IsNullOrWhiteSpace(userInput))
+                return null;
+
+            if (userInput.StartsWith("https://www.amourgis.com/"))
+            {
+                var uri = new Uri(userInput);
+                var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
+                return query["code"];
+            }
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(userInput, @"^[a-zA-Z0-9]{20,}$"))
+                return userInput;
+
+            return null;
+        }
+
+        public async Task GetAccessTokenAsync(string authorizationCode)
+        {
+            AccessToken = await _clioApiClient.GetAccessTokenAsync(authorizationCode);
+        }
+
+
+    }
+}
+
+
+// File: BusinessLogic\ClioService.cs
+// Project: CalliAPI
+// Namespace: CalliAPI.BusinessLogic
+// FileName: ClioService.cs
+// Jacob Hayes
+// 2025 05 21
+
+// FastFetch refers to the process of quickly retrieving all matters from Clio through parallization of offset requests.
+
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using CalliAPI.Interfaces;
+using CalliAPI.Models;
+using AmourgisCOREServices;
+using CalliAPI.Utilities;
+using CalliAPI.DataAccess;
+using Task = System.Threading.Tasks.Task;
+using Microsoft.Identity.Client;
+using System.Net;
+
+namespace CalliAPI.BusinessLogic
+{
+    public class ClioService
+    {
+        
+        private readonly AMO_Logger _logger;
+        private readonly ClioApiClient _clioApiClient;
+        private readonly AuthService _authService;
+
+
+
+        public static string[] prefileStages =
+            [
+                "prefile",
+                "pif - prefile",
+                "case prep",
+                "pif - case prep",
+                "signing and filing",
+                "prefiling",
+                "pif - prefiling"
+            ];
+
+        public ClioService(ClioApiClient clioApiClient, AuthService authService, AMO_Logger logger)
+        {
+            _clioApiClient = clioApiClient;
+            _authService = authService;
+            _logger = logger;
+        }
+
+
+        #region Authentication Methods
+        public string GetAuthorizationUrl()
+        {
+            return _authService.GetAuthorizationUrl();
+        }
+
+        public async Task GetAccessTokenAsync(string authorizationCode)
+        {
+            await _authService.GetAccessTokenAsync(authorizationCode);
+        }
+
+        public string ValidateAuthorizationCode(string userInput)
+        {
+            return _authService.ValidateAuthorizationCode(userInput);
+        }
+        #endregion
+
+        #region event delegates
+        public event Action<int, int> ProgressUpdated
+        {
+            add => _clioApiClient.ProgressUpdated += value;
+            remove => _clioApiClient.ProgressUpdated -= value;
+        }
+        public bool IsAuthenticated => !string.IsNullOrWhiteSpace(_authService.AccessToken);
+        #endregion
+
+        public async Task<HttpResponseMessage> VerifyAPI()
+        {
+            return await _clioApiClient.VerifyAPI(_authService.AccessToken);
+        }
+
+
+        public async Task<List<Matter>> GetMattersNotCurrentlyBeingWorked()
+        {
+            return await _clioApiClient.GetMattersNotCurrentlyBeingWorked(_authService.AccessToken);
+        }
+
+
+        public static string GetPrefileStageDescription()
+        {
+            return $"Prefile stages include: {string.Join(", ", prefileStages)}.";
+        }
+
+
+        #region Custom Report Methods
+        #endregion
+
+        #region Classic Reports
+        #region reports - open Matters
+
+
+        public async Task GetAllOpenMatters()
+        {
+            // Initialize the matter stream and filter it
+            IAsyncEnumerable<Matter> matters = _clioApiClient.GetAllOpenMattersAsync();
+            // Convert the matter stream to a DataTable and show it
+            await ReportLauncher.ShowAsync(matters);
+        }
+
+        public async Task GetAllOpen713Matters()
+        {
+            // Initialize the matter stream and filter it
+            IAsyncEnumerable<Matter> matters = _clioApiClient.GetAllOpenMattersAsync().FilterByPracticeAreaSuffixAsync(new string[] { "7", "13" });
+            // Convert the matter stream to a DataTable and show it
+            await ReportLauncher.ShowAsync(matters);
+        }
+
+        public async Task GetUnworked713Matters()
+        {
+
+            // Initialize the matter stream and filter it
+            IAsyncEnumerable<Matter> matters = _clioApiClient.GetAllOpenMattersAsync().
+                FilterByPracticeAreaSuffixAsync(new string[] { "7", "13" }).
+                FilterByStageNameAsync(prefileStages);
+
+            IAsyncEnumerable<Matter> filteredMatters = FilterMattersWithNoOpenTasksAsync(matters);
+
+            // Convert the matter stream to a DataTable and show it
+            await ReportLauncher.ShowAsync(filteredMatters);
+        }
+
+
+        #endregion
+
+        #region reports - all Matters
+        public async Task GetAllMattersAsync(string fields="", string status="", string addedHtml="")
+        {
+            // Initialize the matter stream
+            IAsyncEnumerable<Matter> matters = _clioApiClient.GetAllMattersAsync(fields, status, addedHtml);
+            // Filter the matter stream (since this is ALL matters, we don't need to bother with filtering)
+            // matters = matters.FilterByWhatever();
+            // Convert the matter stream to a DataTable and show it
+            await ReportLauncher.ShowAsync(matters);
+        }
+
+
+
+        #endregion
+
+        #region helper methods
+
+        public async Task<bool> MatterHasNoOpenTasksAsync(Matter matter)
+        {
+            if (!matter.has_tasks)
+                return true;
+
+            var tasks = await _clioApiClient.GetTasksForMatterAsync(matter.id);
+            return tasks.All(t => t.status.Equals("complete", StringComparison.OrdinalIgnoreCase));
+        }
+
+
+        public async IAsyncEnumerable<Matter> FilterMattersWithNoOpenTasksAsync(IAsyncEnumerable<Matter> matters)
+        {
+            await foreach (var matter in matters)
+            {
+                if (await MatterHasNoOpenTasksAsync(matter))
+                {
+                    _logger.Info($"No tasks found for matter {matter.id.ToString()}.");
+                    yield return matter;
+                }
+            }
+        }
+
+
+        #endregion
+        #endregion
+        #region FastFetch reports
+        public async Task FastFetchAllMatters(DateTime dateSince)
+        {
+            IAsyncEnumerable<Matter> matters = _clioApiClient.FastFetchMattersSinceAsync(dateSince);
+
+            await ReportLauncher.ShowAsync(matters);
+        }
+        #endregion
+
+    }
+}
+
+
+// File: DataAccess\ClioApiClient.cs
+using CalliAPI.Interfaces;
+using CalliAPI.Models;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+using CalliAPI.Properties;
+using System.Text.RegularExpressions;
+using CalliAPI.Properties;
+using CalliAPI.Models;
+using Task = System.Threading.Tasks.Task;
+using System.Diagnostics.Metrics;
+using AmourgisCOREServices;
+using Polly;
+using System.Net.Sockets;
+using System.Net;
+using System.Drawing.Printing;
+using System.Threading;
+using System.Runtime.CompilerServices;
+using ClioTask = CalliAPI.Models.Task;
+using DocumentFormat.OpenXml.Drawing.Charts;
+
+namespace CalliAPI.DataAccess
+{
+    public class ClioApiClient : IClioApiClient
+    {
+        
+
+        private const string MatterFields = @"id,practice_area{name},description,display_number,status,has_tasks,client{id,name},matter_stage{name},custom_field_values{id,value,custom_field}";
+
+        private readonly HttpClient _httpClient;
+        private readonly AMO_Logger _logger;
+        private string clientSecret = string.Empty;
+        private AsyncPolicy<HttpResponseMessage> _retryPolicy;
+        //private List<string> practiceAreas = new List<string>
+        //{
+        //    "AK", "CA", "CB", "CL", "CN", "DY", "TD", "WA", "YO"
+        //};
+
+
+        public ClioApiClient(HttpClient httpClient, AMO_Logger logger)
+        {
+            _httpClient = httpClient;
+            _logger = logger;
+            clientSecret = Environment.GetEnvironmentVariable("CLIO_CLIENT_SECRET");
+
+
+        _retryPolicy = Policy
+        .Handle<HttpRequestException>()
+        .OrResult<HttpResponseMessage>(r => (int)r.StatusCode == 429)
+        .WaitAndRetryAsync(
+            retryCount: 5,
+            sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)),
+            onRetry: (outcome, delay, attempt, context) =>
+            { 
+                if (outcome.Exception != null)
+                {
+                    _logger.Warn($"Exception on attempt {attempt}: {outcome.Exception.Message}. Retrying in {delay.TotalSeconds} seconds...");
+                }
+                else
+                {
+                    _logger.Warn($"Retrying due to HTTP {outcome.Result.StatusCode}. Delay: {delay.TotalSeconds} seconds...");
+                }
+            });
+
+        }
+
+        #region delegates
+
+        public event Action<int, int> ProgressUpdated;
+
+        #endregion
+
+
+
+
+
+
+        public async Task<HttpResponseMessage> VerifyAPI(string accessToken)
+        {
+            _httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+            string apiUrl = "https://app.clio.com/api/v4/users/who_am_i";
+            HttpResponseMessage response = await _httpClient.GetAsync(apiUrl);
+            return response;
+        }
+
+        public async Task<string> GetAccessTokenAsync(string authorizationCode)
+        {
+            string tokenEndpoint = "https://app.clio.com/oauth/token";
+            // Package up the request data and send it to the token endpoint so we can grab the access_token string
+            var requestData = new Dictionary<string, string>
+            {
+            { "grant_type", "authorization_code" },
+            { "code", authorizationCode },
+            { "redirect_uri", "https://www.amourgis.com/" },
+            { "client_id", Properties.Settings.Default.ClientId },
+            { "client_secret", clientSecret}
+            };
+
+
+            _logger.Info("Requesting access token with data: " +
+                            string.Join(", ", requestData.Select(kvp => $"{kvp.Key}={kvp.Value}")));
+
+            var response = await _httpClient.PostAsync(tokenEndpoint, new FormUrlEncodedContent(requestData));
+
+            var responseContent = await response.Content.ReadAsStringAsync();
+
+            _logger.Info("Token response: " + responseContent);
+
+            try
+            {
+                var jsonDocument = JsonDocument.Parse(responseContent);
+                string accessToken = jsonDocument.RootElement.GetProperty("access_token").GetString();
+                return accessToken;
+            }
+            catch (KeyNotFoundException)
+            {
+                _logger.Error("Access token not found in response.");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"Unexpected error parsing token response: {ex.Message}");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// This method attempts to get a property from a JsonElement. It checks if the property exists and if its value is an object.
+        /// </summary>
+        /// <param name="element">The JsonElement</param>
+        /// <param name="propertyName">The property to attempt to recover from the JsonElement</param>
+        /// <param name="result">The output of the attempt to access the JsonValueKind.Object from the JsonElement</param>
+        /// <returns>True if TryGetProperty() && ValueKind == JsonValueKind.Object, else false</returns>
+        private bool TryGetObject(JsonElement element, string propertyName, out JsonElement result)
+        {
+            result = default;
+            if (element.TryGetProperty(propertyName, out var temp) && temp.ValueKind == JsonValueKind.Object)
+            {
+                result = temp;
+                return true;
+            }
+            return false;
+        }
+
+
+        private static string TryGetString(JsonElement element, string propertyName)
+        {
+            return element.TryGetProperty(propertyName, out var prop) && prop.ValueKind == JsonValueKind.String
+            ? prop.GetString()
+            : null;
+        }
+
+
+
+        public Matter ParseMatter(JsonElement element)
+        {
+            try
+            {
+                Matter matter = JsonSerializer.Deserialize<Matter>(element.GetRawText());
+
+                return matter;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"Error parsing matter: {ex.Message}");
+                throw;
+            }
+        }
+
+
+        #region Tasks
+
+        public async Task<List<ClioTask>> GetTasksForMatterAsync(long matterId)
+        {
+            string url = $"{Properties.Settings.Default.ApiUrl}tasks?matter_id={matterId}&fields=id,subject,status";
+            var response = await _retryPolicy.ExecuteAsync(() => _httpClient.GetAsync(url));
+            var responseContent = await response.Content.ReadAsStringAsync();
+            using var jsonDocument = JsonDocument.Parse(responseContent);
+
+            try
+            {
+                if (jsonDocument.RootElement.TryGetProperty("data", out JsonElement dataElement))
+                {
+                    return dataElement.EnumerateArray().Select(t => new ClioTask
+                    {
+                        id = t.GetProperty("id").GetInt64(),
+                        status = t.GetProperty("status").GetString()
+                    }).ToList();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"Error parsing tasks: {ex.Message}");
+                throw;
+            }
+            return new List<ClioTask>();
+        }
+
+        #endregion
+
+
+        #region reporting functions
+
+        /// <summary>
+        /// Get a list of all the matters as Matter objects. Use this with MatterFilters.cs to filter the list of matters.
+        /// </summary>
+        /// <returns></returns>
+        public async IAsyncEnumerable<Matter> GetAllMattersAsync(string fields = "", string status = "", string addedHttp = "")
+        {
+            _logger.Info("API CALL START -- GET ALL MATTERS ASYNC --");
+
+            if (string.IsNullOrEmpty(fields)) 
+                fields = MatterFields; // Default to the predefined fields if none are provided
+            else
+                if (!fields.StartsWith("id"))
+                    fields = "id," + fields; // Ensure 'id' is always included in the fields
+
+            if (string.IsNullOrEmpty(status)) status = "open,pending,closed"; // Default to all matters if no status is provided
+            if (!addedHttp.StartsWith("&")) addedHttp = "&" + addedHttp; // Ensure the additional parameters start with '&'
+
+            string nextPageUrl = $"{Properties.Settings.Default.ApiUrl}matters?" +
+                                $"fields={fields}" + // Use the provided fields or default to MatterFields
+                                $"&status={status}" + // Use the provided status or default to all
+                                $"{addedHttp}" + // Add any additional parameters provided
+                                "&order=id(asc)";
+
+            int pageCount = 0;
+            int maxPages = 9999;
+            int totalRecords;
+            int totalPages = 0;
+
+            while (!string.IsNullOrEmpty(nextPageUrl) && pageCount < maxPages) // While there exists another page of results...
+            {
+                pageCount++;
+                _logger.Info($"Fetching page {pageCount}: {nextPageUrl}");
+
+
+                // Get the next page (retrying with Polly)
+                var response = await _retryPolicy.ExecuteAsync(() => _httpClient.GetAsync(nextPageUrl));
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.Error($"Failed to fetch matters: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
+                    yield break;
+                }
+
+                var content = await response.Content.ReadAsStringAsync();
+
+                JsonDocument json;
+
+                try // Parse the JSON response
+                {
+                    json = JsonDocument.Parse(content);
+                }
+                catch (JsonException ex)
+                {
+                    _logger.Error($"Failed to parse JSON: {ex.Message}");
+                    yield break;
+                }
+
+                // Only extract totalRecords on the first page
+                if (pageCount == 1 &&
+                    json.RootElement.TryGetProperty("meta", out var metaElement) &&
+                    metaElement.TryGetProperty("records", out var recordsElement) &&
+                    recordsElement.TryGetInt32(out totalRecords))
+                {
+                    totalPages = (int)Math.Ceiling(totalRecords / 200.0);
+                    _logger.Info($"Total records: {totalRecords}, estimated pages: {totalPages}");
+                }
+
+                // Update progress bar here (if you pass a callback or use an event)
+                ProgressUpdated?.Invoke(pageCount, totalPages);
+
+
+
+                // If there's a data element, parse it
+
+                // Using the using block to ensure it's disposed of later...
+                using (json)
+                {
+                    if (json.RootElement.TryGetProperty("data", out var dataElement))
+                    {
+                        foreach (var element in dataElement.EnumerateArray())
+                        {
+                            yield return ParseMatter(element);
+                        }
+                    }
+
+                    nextPageUrl = json.RootElement
+                        .GetProperty("meta")
+                        .GetProperty("paging")
+                        .TryGetProperty("next", out var nextElement)
+                        ? nextElement.GetString()
+                        : null;
+
+                    
+                }
+            }
+
+            _logger.Info("API CALL END -- GET ALL MATTERS ASYNC --");
+        }
+
+        /// <summary>
+        /// Get a list of all the open matters as Matter objects. Use this with MatterFilters.cs to filter the list of matters.
+        /// </summary>
+        /// <returns></returns>
+        public async IAsyncEnumerable<Matter> GetAllOpenMattersAsync()
+        {
+            _logger.Info("API CALL START -- GET ALL OPEN MATTERS ASYNC --");
+
+            string nextPageUrl = $"{Properties.Settings.Default.ApiUrl}matters?" +
+                                 $"fields={MatterFields}" +
+                                 "&status=open&order=id(asc)";
+
+            int pageCount = 0;
+            int maxPages = 9999;
+            int totalRecords;
+            int totalPages = 0;
+
+            while (!string.IsNullOrEmpty(nextPageUrl) && pageCount < maxPages) // While there exists another page of results...
+            {
+                pageCount++;
+                _logger.Info($"Fetching page {pageCount}: {nextPageUrl}");
+
+
+                // Get the next page (retrying with Polly)
+                var response = await _retryPolicy.ExecuteAsync(() => _httpClient.GetAsync(nextPageUrl));
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.Error($"Failed to fetch matters: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
+                    yield break;
+                }
+
+                var content = await response.Content.ReadAsStringAsync();
+
+                JsonDocument json;
+
+                try // Parse the JSON response
+                {
+                    json = JsonDocument.Parse(content);
+                }
+                catch (JsonException ex)
+                {
+                    _logger.Error($"Failed to parse JSON: {ex.Message}");
+                    yield break;
+                }
+
+                // Only extract totalRecords on the first page
+                if (pageCount == 1 &&
+                    json.RootElement.TryGetProperty("meta", out var metaElement) &&
+                    metaElement.TryGetProperty("records", out var recordsElement) &&
+                    recordsElement.TryGetInt32(out totalRecords))
+                {
+                    totalPages = (int)Math.Ceiling(totalRecords / 200.0);
+                    _logger.Info($"Total records: {totalRecords}, estimated pages: {totalPages}");
+                }
+
+                // Update progress bar here (if you pass a callback or use an event)
+                ProgressUpdated?.Invoke(pageCount, totalPages);
+
+
+
+                // If there's a data element, parse it
+
+                // Using the using block to ensure it's disposed of later...
+                using (json)
+                {
+                    if (json.RootElement.TryGetProperty("data", out var dataElement))
+                    {
+                        foreach (var element in dataElement.EnumerateArray())
+                        {
+                            yield return ParseMatter(element);
+                        }
+                    }
+
+                    nextPageUrl = json.RootElement
+                        .GetProperty("meta")
+                        .GetProperty("paging")
+                        .TryGetProperty("next", out var nextElement)
+                        ? nextElement.GetString()
+                        : null;
+
+
+                }
+            }
+
+            _logger.Info("API CALL END -- GET ALL OPEN MATTERS ASYNC --");
+        }
+
+
+
+        /// <summary>
+        /// Fetches up to 10,000 Matter records created since the given date using offset-based pagination,
+        /// parallelized for performance. Results are streamed back as an IAsyncEnumerable.
+        /// </summary>
+        public async IAsyncEnumerable<Matter> FastFetchMattersSinceAsync(
+         DateTime sinceDate,
+         [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            // Constants for pagination and throttling
+            const int PageSize = 200;                   // Clio API max page size
+            const int MaxRecords = 10000;               // Safety cap to avoid over-fetching
+            const int MaxParallelRequests = 10;         // Limit concurrent requests to avoid rate limiting
+
+            int totalPages = MaxRecords / PageSize;     // Total pages to fetch (e.g., 50 for 10,000 records)
+            int completedPages = 0;                     // Tracks how many pages have completed
+            int totalRecordsFetched = 0;                // Tracks total records fetched across all pages
+
+            // Build base URL and query parameters
+            string baseUrl = $"{Properties.Settings.Default.ApiUrl}matters";
+            string fields = MatterFields;
+            string isoDate = sinceDate.ToUniversalTime().ToString("o"); // ISO 8601 format
+
+            var throttler = new SemaphoreSlim(MaxParallelRequests); // Controls how many requests run at once
+
+            // Create a list of tasks, one for each page (offset)
+            var tasks = Enumerable.Range(0, totalPages).Select(async i =>
+            {
+                int offset = i * PageSize;
+                string url = $"{baseUrl}?fields={Uri.EscapeDataString(fields)}&created_since={Uri.EscapeDataString(isoDate)}&limit={PageSize}&offset={offset}";
+                _logger.Info($"Requesting {url}");
+                await throttler.WaitAsync(cancellationToken); // Wait for a slot to run
+                try
+                {
+                    // Use Polly to retry transient failures
+                    var response = await _retryPolicy.ExecuteAsync(() =>
+         _httpClient.GetAsync(url, cancellationToken));
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        _logger.Warn($"[ParallelFetch] Failed at offset {offset}: {response.StatusCode}");
+                        return Enumerable.Empty<Matter>();
+                    }
+
+                    var content = await response.Content.ReadAsStringAsync(cancellationToken);
+                    var json = JsonDocument.Parse(content);
+
+                    var matters = new List<Matter>();
+                    if (json.RootElement.TryGetProperty("data", out var dataElement))
+                    {
+                        foreach (var element in dataElement.EnumerateArray())
+                        {
+                            matters.Add(ParseMatter(element)); // Convert JSON to Matter object
+                        }
+                    }
+
+                    // Safely increment the total record count
+                    Interlocked.Add(ref totalRecordsFetched, matters.Count);
+                    return matters;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error($"[ParallelFetch] Exception at offset {offset}: {ex.Message}");
+                    return Enumerable.Empty<Matter>();
+                }
+                finally
+                {
+                    // Update progress and release the throttler slot
+                    int newPageCount = Interlocked.Increment(ref completedPages);
+                    ProgressUpdated?.Invoke(newPageCount, totalPages);
+                    throttler.Release();
+                }
+            }).ToList();
+
+            // As each task completes, yield its results
+            foreach (var task in tasks)
+            {
+                var matters = await task;
+                foreach (var matter in matters)
+                {
+                    yield return matter;
+                }
+            }
+
+            // Warn if we hit the record cap
+            if (totalRecordsFetched >= MaxRecords)
+            {
+                _logger.Warn($"[ParallelFetch] Record cap of {MaxRecords} reached. Results may be incomplete.");
+                MessageBox.Show(
+                $"Only the first {MaxRecords} records were fetched. The results may be incomplete.\n\n" +
+                $"Try narrowing your date range or applying filters.",
+                "Record Limit Reached",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            }
+        }
+
+        public async IAsyncEnumerable<Matter> FastFetchOpenMattersSinceAsync(
+ DateTime sinceDate,
+ [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            // Constants for pagination and throttling
+            const int PageSize = 200;                   // Clio API max page size
+            const int MaxRecords = 10000;               // Safety cap to avoid over-fetching
+            const int MaxParallelRequests = 10;         // Limit concurrent requests to avoid rate limiting
+
+            int totalPages = MaxRecords / PageSize;     // Total pages to fetch (e.g., 50 for 10,000 records)
+            int completedPages = 0;                     // Tracks how many pages have completed
+            int totalRecordsFetched = 0;                // Tracks total records fetched across all pages
+
+            // Build base URL and query parameters
+            string baseUrl = $"{Properties.Settings.Default.ApiUrl}matters";
+            string fields = $"{MatterFields}&status=open";
+            string isoDate = sinceDate.ToUniversalTime().ToString("o"); // ISO 8601 format
+
+            var throttler = new SemaphoreSlim(MaxParallelRequests); // Controls how many requests run at once
+
+            // Create a list of tasks, one for each page (offset)
+            var tasks = Enumerable.Range(0, totalPages).Select(async i =>
+            {
+                int offset = i * PageSize;
+                string url = $"{baseUrl}?fields={Uri.EscapeDataString(fields)}&created_since={Uri.EscapeDataString(isoDate)}&limit={PageSize}&offset={offset}";
+
+                await throttler.WaitAsync(cancellationToken); // Wait for a slot to run
+                try
+                {
+                    // Use Polly to retry transient failures
+                    var response = await _retryPolicy.ExecuteAsync(() =>
+         _httpClient.GetAsync(url, cancellationToken));
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        _logger.Warn($"[ParallelFetch] Failed at offset {offset}: {response.StatusCode}");
+                        return Enumerable.Empty<Matter>();
+                    }
+
+                    var content = await response.Content.ReadAsStringAsync(cancellationToken);
+                    var json = JsonDocument.Parse(content);
+
+                    var matters = new List<Matter>();
+                    if (json.RootElement.TryGetProperty("data", out var dataElement))
+                    {
+                        foreach (var element in dataElement.EnumerateArray())
+                        {
+                            matters.Add(ParseMatter(element)); // Convert JSON to Matter object
+                        }
+                    }
+
+                    // Safely increment the total record count
+                    Interlocked.Add(ref totalRecordsFetched, matters.Count);
+                    return matters;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error($"[ParallelFetch] Exception at offset {offset}: {ex.Message}");
+                    return Enumerable.Empty<Matter>();
+                }
+                finally
+                {
+                    // Update progress and release the throttler slot
+                    int newPageCount = Interlocked.Increment(ref completedPages);
+                    ProgressUpdated?.Invoke(newPageCount, totalPages);
+                    throttler.Release();
+                }
+            }).ToList();
+
+            // As each task completes, yield its results
+            foreach (var task in tasks)
+            {
+                var matters = await task;
+                foreach (var matter in matters)
+                {
+                    yield return matter;
+                }
+            }
+
+            // Warn if we hit the record cap
+            if (totalRecordsFetched >= MaxRecords)
+            {
+                _logger.Warn($"[ParallelFetch] Record cap of {MaxRecords} reached. Results may be incomplete.");
+                MessageBox.Show(
+                $"Only the first {MaxRecords} records were fetched. The results may be incomplete.\n\n" +
+                $"Try narrowing your date range or applying filters.",
+                "Record Limit Reached",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            }
+        }
+
+
+
+
+
+        /// <summary>
+        /// Get a list of all the Practice Areas as PracticeArea objects
+        /// </summary>
+        /// <returns></returns>
+        public async Task<List<PracticeArea>> GetAllPracticeAreasAsync()
+        {
+            var practiceAreas = new List<PracticeArea>();
+            string url = Properties.Settings.Default.ApiUrl + "practice_areas";
+
+            var response = await _httpClient.GetAsync(url);
+            var responseContent = await response.Content.ReadAsStringAsync();
+            var jsonDocument = JsonDocument.Parse(responseContent);
+
+            if (jsonDocument.RootElement.TryGetProperty("data", out JsonElement dataElement))
+            {
+                practiceAreas = dataElement.EnumerateArray().Select(pa => new PracticeArea
+                {
+                    id = pa.GetProperty("id").GetInt64(),
+                    name = pa.GetProperty("name").GetString()
+                }).ToList();
+            }
+
+            return practiceAreas;
+        }
+
+
+        public List<long> GetRelevantPracticeAreaIds(List<PracticeArea> practiceAreas)
+        {
+            return practiceAreas
+            .Where(pa => pa.name.EndsWith("7") || pa.name.EndsWith("13"))
+            .Select(pa => pa.id)
+            .ToList();
+        }
+
+
+        public async Task<List<Matter>> GetActiveMattersByPracticeAreaAsync(long practiceAreaId, string accessToken)
+        {
+            // This line sets the authorization header for the HTTP client using the access token. This is necessary for authenticating API requests.
+            _httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+            var allMatters = new List<Matter>();
+
+            // This line constructs the URL for the API endpoint to fetch matters. The URL is based on the base API URL and the specific endpoint for matters.
+            string nextPageUrl = Properties.Settings.Default.ApiUrl + "matters?" +
+                "fields=id,practice_area{name},status,has_tasks,client{id,name},matter_stage{name}" +
+                "&practice_area_id=" + practiceAreaId.ToString() +
+                "&status=open,pending";
+
+            // This loop fetches all pages of matters from the API. It continues until there are no more pages to fetch (i.e., nextPageUrl is null or empty).
+            while (!string.IsNullOrEmpty(nextPageUrl))
+            {
+                var response = await _httpClient.GetAsync(nextPageUrl);
+                var responseContent = await response.Content.ReadAsStringAsync();
+                var jsonDocument = JsonDocument.Parse(responseContent);
+
+                // Check if the "data" property exists
+                if (jsonDocument.RootElement.TryGetProperty("data", out JsonElement dataElement))
+                {
+                    // This line calls ParseMatter() on every matter in the response and adds them to the allMatters list.
+                    var matters = dataElement.EnumerateArray().Select(ParseMatter).ToList();
+                    allMatters.AddRange(matters);
+                }
+                else
+                {
+                    Console.WriteLine("The 'data' property was not found in the JSON response.");
+                }
+
+
+                // Check if the "meta" and "paging" properties exist and get the "next" property
+                if (jsonDocument.RootElement.TryGetProperty("meta", out JsonElement metaElement) &&
+                metaElement.TryGetProperty("paging", out JsonElement pagingElement) &&
+                pagingElement.TryGetProperty("next", out JsonElement nextElement))
+                {
+                    nextPageUrl = nextElement.GetString();
+                }
+                else
+                {
+                    nextPageUrl = null;
+                    Console.WriteLine("The 'next' property was not found in the JSON response.");
+                }
+
+            }
+            return allMatters;
+        }
+
+        public async Task<List<Matter>> GetAllActive713MattersAsync(string accessToken)
+        {
+            var practiceAreas = await GetAllPracticeAreasAsync();
+            var relevantPracticeAreaIds = GetRelevantPracticeAreaIds(practiceAreas);
+
+            var allMatters = new List<Matter>();
+
+            foreach (var practiceAreaId in relevantPracticeAreaIds)
+            {
+                var matters = await GetActiveMattersByPracticeAreaAsync(practiceAreaId, accessToken);
+                allMatters.AddRange(matters);
+            }
+
+            return allMatters;
+        }
+
+
+
+
+        /// <summary>
+        /// Fetches all matters that are not currently being worked on.
+        /// </summary>
+        /// <returns></returns>
+        public async Task<List<Matter>> GetMattersNotCurrentlyBeingWorked(string accessToken)
+        {
+            // Implement the logic to fetch matters not currently being worked on - JH 2025-04-21
+            // Defined as matters who:
+            // 1. have a practice area ending in 7 or 13
+            // 2. have a stage in "Prefile" or "PIF - Prefile" or "Case prep" or "PIF - Case prep" or "Signing and Filing"
+            // 3. have no tasks outstanding
+
+            List<string> validStages = new List<string>
+            {
+                "prefile",
+                "pif - prefile",
+                "case prep",
+                "pif - case prep",
+                "signing and filing"
+            };
+
+            var matters = await GetAllActive713MattersAsync(accessToken); // 1. get all matters with a practice area ending in 7 or 13
+
+            var filteredMatters = matters
+                .Where(m => (m.matter_stage_name != null)) // has a stage
+                .Where(m => (validStages.Contains(m.matter_stage_name.ToLower()))); // 2. has a stage in "Prefile" or "PIF - Prefile" or "Case prep" or "PIF - Case prep" or "Signing and Filing"
+
+
+            // Create a list to store matters with no outstanding tasks
+            var mattersWithNoOutstandingTasks = new List<Matter>();
+
+            foreach (var matter in filteredMatters)
+            {
+                string taskUrl = Properties.Settings.Default.ApiUrl + "tasks?matter_id=" + matter.id + "&fields=id,subject,status";
+                var response = await _httpClient.GetAsync(taskUrl);
+                var responseContent = await response.Content.ReadAsStringAsync();
+                var jsonDocument = JsonDocument.Parse(responseContent);
+
+                // Check if the "data" property exists so we can grab the tasks
+                if (jsonDocument.RootElement.TryGetProperty("data", out JsonElement dataElement))
+                {
+                    var tasks = dataElement.EnumerateArray().ToList();
+
+                    // Check if all tasks have the status "complete"
+                    bool allTasksComplete = tasks.All(t => t.GetProperty("status").ToString().Equals("complete", StringComparison.OrdinalIgnoreCase));
+
+                    // If there are no tasks or all tasks are complete, add the matter to the list
+                    if (tasks.Count == 0 || allTasksComplete)
+                    {
+                        mattersWithNoOutstandingTasks.Add(matter);
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("The 'data' property was not found in the JSON response.");
+                }
+
+            }
+
+            return mattersWithNoOutstandingTasks;
+
+
+
+        }
+        #endregion
+
+    }
+}
+
+
+// File: Interfaces\IAuthService.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CalliAPI.Interfaces
+{
+    internal interface IAuthService
+    {
+
+        string GetAuthorizationUrl();
+        string ValidateAuthorizationCode(string userInput);
+        Task GetAccessTokenAsync(string authorizationCode);
+        string AccessToken { get; }
+
+    }
+}
+
+
+// File: Interfaces\IClioApiClient.cs
+using CalliAPI.Models;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Text;
+using System.Threading.Tasks;
+using System.Web;
+
+namespace CalliAPI.Interfaces
+{
+    internal interface IClioApiClient
+    {
+
+        Task<HttpResponseMessage> VerifyAPI(string accessToken);
+        Task<string> GetAccessTokenAsync(string authorizationCode);
+        Task<List<Matter>> GetAllActive713MattersAsync(string accessToken);
+        Task<List<Matter>> GetMattersNotCurrentlyBeingWorked(string accessToken);
+
+    }
+}
+
+
+// File: Interfaces\IClioService.cs
+using CalliAPI.Models;
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CalliAPI.Interfaces
+{
+    internal interface IClioService
+    {
+
+        Task<string> VerifyAPI();
+        Task<List<Matter>> GetMattersNotCurrentlyBeingWorked();
+
+        Task<DataTable> GetMattersNotCurrentlyBeingWorkedAsDataTable();
+        Task<DataTable> GetAllMattersAsDataTable();
+    }
+}
+
+
+// File: Interfaces\IQueryBuilder.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CalliAPI.Interfaces
+{
+    public interface IQueryBuilder<T>
+    {
+        /// <summary>
+        /// The list of fields selected by the user, formatted for the Clio API.
+        /// </summary>
+        public abstract string SelectedFields { get; }
+
+        /// <summary>
+        /// A list of filters to apply to the result stream.
+        /// </summary>
+        public abstract List<Func<IAsyncEnumerable<T>, IAsyncEnumerable<T>>> SelectedFilters { get; }
+
+        /// <summary>
+        /// Optional query parameters to include in the API request.
+        /// </summary>
+        public virtual Dictionary<string, string> QueryParameters => new();
+
+        /// <summary>
+        /// Optional description of the query for logging or display.
+        /// </summary>
+        public virtual string QueryDescription =>
+     $"Fields: {SelectedFields}, Filters: {SelectedFilters.Count}";
+    }
+}
+
+
+// File: Interfaces\IReportContext.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CalliAPI.Interfaces
+{
+    public interface IReportContext
+    {
+        void SetReportName(string name);
+        Task SetProgress(int current, int total);
+    }
+}
+
+
+// File: Models\Client.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CalliAPI.Models
+{
+    public class Client
+    {
+        public long id { get; set; }
+        public string name { get; set; }
+
+        public string first_name { get; set; }
+        public string middle_name { get; set; }
+        public string last_name { get; set; }
+        public string date_of_birth { get; set; }
+        public string created_at { get; set; }
+        public string updated_at { get; set; }
+        public string prefix { get; set; }
+        public string title { get; set; }
+        public string initials { get; set; }
+        public string clio_connect_email { get; set; }
+        public string primary_email_address { get; set; }
+
+    }
+}
+
+
+// File: Models\CustomFieldMap.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CalliAPI.Models
+{
+
+    public enum CustomField
+    {
+        EmergencyCaseType,
+        ExpectedPIFDate,
+        PaymentPlanInfo
+    }
+
+    internal class CustomFieldMap
+    {
+        private static readonly Dictionary<CustomField, long> _fieldIds = new Dictionary<CustomField, long>()
+        {
+            { CustomField.EmergencyCaseType, 13584798 },
+            { CustomField.ExpectedPIFDate, 13582698 },
+            { CustomField.PaymentPlanInfo, 13582683 }
+        };
+
+        public static long GetId(CustomField field) => _fieldIds[field];
+
+        public static bool TryGetField(long id, out CustomField field)
+        {
+            field = _fieldIds.FirstOrDefault(kvp => kvp.Value == id).Key;
+            return _fieldIds.ContainsValue(id);
+        }
+
+    }
+}
+
+
+// File: Models\CustomFieldValue.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+
+namespace CalliAPI.Models
+{
+
+    public class CustomFieldValue
+    {
+        public string id { get; set; }
+        public JsonElement value { get; set; } // Can be string, number, or null
+        public CustomFieldMetadata custom_field { get; set; }
+    }
+
+    public class CustomFieldMetadata
+    {
+        public long id { get; set; }
+        public string etag { get; set; }
+    }
+
+}
+
+
+// File: Models\Matter.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Text.Json.Serialization;
+using System.Threading.Tasks;
+
+namespace CalliAPI.Models
+{
+    public class Matter
+    {
+        public long id { get; set; }
+        public int number { get; set; }
+        public string display_number { get; set; }
+        public string custom_number { get; set; }
+        public string description { get; set; }
+        public string status { get; set; }
+        public string created_at { get; set; }
+        public string updated_at { get; set; }
+        public bool has_tasks { get; set; }
+        public string matter_stage_name { get; set; }
+        
+        public string practice_area_name { get; set; }
+
+        public Client client { get; set; }
+
+        //public Dictionary<CustomField, string> CustomFields { get; set; } = new Dictionary<CustomField, string>();
+
+        [JsonPropertyName("custom_field_values")]
+        public List<CustomFieldValue> CustomFields { get; set; }
+
+    }
+}
+
+
+// File: Models\MatterFilters.cs
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+using CalliAPI.DataAccess;
+
+namespace CalliAPI.Models
+{
+    internal static class MatterFilters
+    {
+
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="matters"></param>
+        /// <param name="status"></param>
+        /// <returns></returns>
+        public static async IAsyncEnumerable<Matter> FilterByStatusAsync(this IAsyncEnumerable<Matter> matters, string status)
+        {
+            await foreach (var matter in matters)
+            {
+                if (matter.status == status)
+                {
+                    yield return matter;
+                }
+            }
+        }
+
+
+
+        /// <summary>
+        /// Filters matters by a custom field. For example:
+        /// For a date comparison: var filtered = matters.FilterByCustomFieldAsync(CustomField.DateOf341Meeting,value => DateTime.TryParse(value, out var date) && date >= new DateTime(2025, 6, 1));
+        /// </summary>
+        /// <param name="matters"></param>
+        /// <param name="field"></param>
+        /// <param name="predicate"></param>
+        /// <returns></returns>
+        public static async IAsyncEnumerable<Matter> FilterByCustomFieldAsync(
+    this IAsyncEnumerable<Matter> matters,
+    CustomField field,
+    Func<string, bool> predicate)
+{
+            if (field == null)
+            {
+                throw new ArgumentNullException(nameof(field), "Custom field cannot be null.");
+            }
+            if (predicate == null)
+            {
+                throw new ArgumentNullException(nameof(predicate), "Predicate function cannot be null.");
+            }
+
+            // Get the field ID from the CustomFieldMap so we have a numeric id
+            long fieldId = CustomFieldMap.GetId(field);
+
+        await foreach (var matter in matters)
+    {
+                // Get the first custom field that matches the id and check if its value matches the predicate
+                var match = matter.CustomFields?
+            .FirstOrDefault(cf => cf.custom_field?.id == fieldId);
+
+        if (match != null && match.value.ValueKind != JsonValueKind.Null)
+        {
+            string value = match.value.ToString();
+            if (predicate(value))
+            {
+                yield return matter;
+            }
+}
+    }
+}
+
+    //    public static async IAsyncEnumerable<Matter> FilterByCustomFieldAsync(
+    //this IAsyncEnumerable<Matter> matters,
+    //CustomField field,
+    //Func<string, bool> predicate)
+    //    {
+    //        await foreach (var matter in matters)
+    //        {
+    //            if (matter.CustomFields.TryGetValue(field, out var value) && predicate(value))
+    //            {
+    //                yield return matter;
+    //            }
+    //        }
+    //    }
+
+
+        public static async IAsyncEnumerable<Matter> FilterByPracticeAreaSuffixAsync(this IAsyncEnumerable<Matter> matters, params string[] suffixes)
+        {
+            await foreach (var matter in matters)
+            {
+                if (matter.practice_area_name != null && suffixes.Any(suffix => matter.practice_area_name.EndsWith(suffix)))
+                {
+                    yield return matter;
+                }
+            }
+        }
+
+        public static async IAsyncEnumerable<Matter> FilterByStageNameAsync(this IAsyncEnumerable<Matter> matters, params string[] stageNames)
+        {
+            await foreach (var matter in matters)
+            {
+                if (matter.matter_stage_name != null && stageNames.Any(stageName => matter.matter_stage_name.Trim().ToLower().Equals(stageName.Trim().ToLower())))
+                {
+                    yield return matter;
+                }
+            }
+        }
+
+
+        /// <summary>
+        /// Converts an IAsyncEnumerable of Matter objects to a DataTable, attempting to include all relevant properties.
+        /// </summary>
+        /// <param name="matters"></param>
+        /// <returns></returns>
+        public static async Task<DataTable> ToSmartDataTableAsync(this IAsyncEnumerable<Matter> matters)
+        {
+            var table = new DataTable();
+            var rows = new List<Dictionary<string, object>>();
+            var columns = new HashSet<string>();
+
+            // Await foreach will consume the IAsyncEnumerable and won't break early unless we tell it to. This allows us to work on the entire collection, without worrying about potential data loss to
+            // the async nature of the enumerable.
+            await foreach (var matter in matters)
+            {
+                var row = new Dictionary<string, object>();
+
+                // Add Matter properties
+                foreach (var prop in typeof(Matter).GetProperties())
+                {
+                    var value = prop.GetValue(matter);
+                    if (value != null & prop.Name != "client") // Skip client info for now
+                    {
+                        string columnName = prop.Name;
+                        columns.Add(columnName);
+                        row[columnName] = value;
+                    }
+                }
+
+                // Add Client properties (flattened)
+                if (matter.client != null)
+                {
+                    foreach (var clientProp in typeof(Client).GetProperties())
+                    {
+                        var clientValue = clientProp.GetValue(matter.client);
+                        if (clientValue != null)
+                        {
+                            string columnName = clientProp.Name;
+                            columns.Add(columnName);
+                            row[columnName] = clientValue;
+                        }
+                    }
+                }
+
+
+                // Include custom fields
+                if (matter.CustomFields != null)
+                {
+                    foreach (var field in matter.CustomFields)
+                    {
+                        string columnName = field.custom_field.id.ToString();
+                        columns.Add(columnName);
+                        row[columnName] = (field.value.ValueKind == JsonValueKind.Null) ? null : field.value.ToString();
+                    }
+                }
+
+                rows.Add(row);
+            }
+
+            // Add columns to the table
+            foreach (var column in columns)
+            {
+                table.Columns.Add(column);
+            }
+
+            // Add rows to the table
+            foreach (var row in rows)
+            {
+                var dataRow = table.NewRow();
+                foreach (var kvp in row)
+                {
+                    dataRow[kvp.Key] = kvp.Value;
+                }
+                table.Rows.Add(dataRow);
+            }
+
+            return table;
+        }
+
+
+
+        public static async Task<DataTable> ToDataTableAsync(this IAsyncEnumerable<Matter> matters)
+        {
+            var table = new DataTable();
+            table.Columns.Add("Id", typeof(long));
+            table.Columns.Add("Practice Area", typeof(string));
+            table.Columns.Add("Stage", typeof(string));
+
+            await foreach (var matter in matters)
+            {
+                table.Rows.Add(matter.id, matter.practice_area_name, matter.matter_stage_name);
+            }
+
+            return table;
+        }
+
+
+    }
+}
+
+
+// File: Models\PracticeArea.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CalliAPI.Models
+{
+    public class PracticeArea
+    {
+        public long id { get; set; }
+        public string name { get; set; }
+    }
+}
+
+
+// File: Models\Task.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CalliAPI.Models
+{
+    public class Task
+    {
+        public long id { get; set; }
+        public string name { get; set; }
+        public string status { get; set; }
+        public long matter_id { get; set; }
+    }
+}
+
+
+// File: Models\TaskFilters.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CalliAPI.Models
+{
+    internal class TaskFilters
+    {
+    }
+}
+
+
+// File: Properties\Resources.Designer.cs
+//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//     Runtime Version:4.0.30319.42000
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+namespace CalliAPI.Properties {
+    using System;
+    
+    
+    /// <summary>
+    ///   A strongly-typed resource class, for looking up localized strings, etc.
+    /// </summary>
+    // This class was auto-generated by the StronglyTypedResourceBuilder
+    // class via a tool like ResGen or Visual Studio.
+    // To add or remove a member, edit your .ResX file then rerun ResGen
+    // with the /str option, or rebuild your VS project.
+    [global::System.CodeDom.Compiler.GeneratedCodeAttribute("System.Resources.Tools.StronglyTypedResourceBuilder", "17.0.0.0")]
+    [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+    [global::System.Runtime.CompilerServices.CompilerGeneratedAttribute()]
+    internal class Resources {
+        
+        private static global::System.Resources.ResourceManager resourceMan;
+        
+        private static global::System.Globalization.CultureInfo resourceCulture;
+        
+        [global::System.Diagnostics.CodeAnalysis.SuppressMessageAttribute("Microsoft.Performance", "CA1811:AvoidUncalledPrivateCode")]
+        internal Resources() {
+        }
+        
+        /// <summary>
+        ///   Returns the cached ResourceManager instance used by this class.
+        /// </summary>
+        [global::System.ComponentModel.EditorBrowsableAttribute(global::System.ComponentModel.EditorBrowsableState.Advanced)]
+        internal static global::System.Resources.ResourceManager ResourceManager {
+            get {
+                if (object.ReferenceEquals(resourceMan, null)) {
+                    global::System.Resources.ResourceManager temp = new global::System.Resources.ResourceManager("CalliAPI.Properties.Resources", typeof(Resources).Assembly);
+                    resourceMan = temp;
+                }
+                return resourceMan;
+            }
+        }
+        
+        /// <summary>
+        ///   Overrides the current thread's CurrentUICulture property for all
+        ///   resource lookups using this strongly typed resource class.
+        /// </summary>
+        [global::System.ComponentModel.EditorBrowsableAttribute(global::System.ComponentModel.EditorBrowsableState.Advanced)]
+        internal static global::System.Globalization.CultureInfo Culture {
+            get {
+                return resourceCulture;
+            }
+            set {
+                resourceCulture = value;
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized resource of type System.Drawing.Bitmap.
+        /// </summary>
+        internal static System.Drawing.Bitmap AllowAccess {
+            get {
+                object obj = ResourceManager.GetObject("AllowAccess", resourceCulture);
+                return ((System.Drawing.Bitmap)(obj));
+            }
+        }
+    }
+}
+
+
+// File: Properties\Settings.Designer.cs
+//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//     Runtime Version:4.0.30319.42000
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+namespace CalliAPI.Properties {
+    
+    
+    [global::System.Runtime.CompilerServices.CompilerGeneratedAttribute()]
+    [global::System.CodeDom.Compiler.GeneratedCodeAttribute("Microsoft.VisualStudio.Editors.SettingsDesigner.SettingsSingleFileGenerator", "17.13.0.0")]
+    public sealed partial class Settings : global::System.Configuration.ApplicationSettingsBase {
+        
+        private static Settings defaultInstance = ((Settings)(global::System.Configuration.ApplicationSettingsBase.Synchronized(new Settings())));
+        
+        public static Settings Default {
+            get {
+                return defaultInstance;
+            }
+        }
+        
+        [global::System.Configuration.ApplicationScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("Data Source=vm-prod-sql01;Initial Catalog=CalliAPI;Integrated Security=True")]
+        public string SqlConnectionString {
+            get {
+                return ((string)(this["SqlConnectionString"]));
+            }
+        }
+        
+        [global::System.Configuration.ApplicationScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("lZZ1pO1AitUzeZeGAYFCvCXWVc2xLJQHiEqAj2Uc")]
+        public string ClientId {
+            get {
+                return ((string)(this["ClientId"]));
+            }
+        }
+        
+        [global::System.Configuration.ApplicationScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("https://www.amourgis.com/")]
+        public string RedirectUri {
+            get {
+                return ((string)(this["RedirectUri"]));
+            }
+        }
+        
+        [global::System.Configuration.ApplicationScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("https://app.clio.com/api/v4/")]
+        public string ApiUrl {
+            get {
+                return ((string)(this["ApiUrl"]));
+            }
+        }
+    }
+}
+
+
+// File: Releases\assets.win.json
+[{"RelativeFileName":"CalliAPI-3.1.1-delta.nupkg","Type":"Delta"},{"RelativeFileName":"CalliAPI-win-Setup.exe","Type":"Installer"},{"RelativeFileName":"CalliAPI-3.1.1-full.nupkg","Type":"Full"},{"RelativeFileName":"CalliAPI-win-Portable.zip","Type":"Portable"}]
+
+// File: Releases\releases.win.json
+{"Assets":[{"PackageId":"CalliAPI","Version":"3.1.1","Type":"Full","FileName":"CalliAPI-3.1.1-full.nupkg","SHA1":"A7F2DBC688DFD0504A3E3660DB134FC7C9C9EC70","SHA256":"01839870127857842B214124CF28DC16AA2D82400B71A888FD3598F8EC43706D","Size":96992480},{"PackageId":"CalliAPI","Version":"3.1.1","Type":"Delta","FileName":"CalliAPI-3.1.1-delta.nupkg","SHA1":"48239248AEFE7089576B12CF2C769FE8B652015F","SHA256":"607AFC643473F676EFCE1D8528479A92B5CD85BB3C3F67D469A2281F522503AC","Size":4222481},{"PackageId":"CalliAPI","Version":"3.1.0","Type":"Full","FileName":"CalliAPI-3.1.0-full.nupkg","SHA1":"157A77F6F108F5E7F45B61EAB0C53A8E57E0A8C2","SHA256":"BE391A62262A9D1D43E584CB501D98A28617673D3C800C69D317BDA071E727A5","Size":91439367},{"PackageId":"CalliAPI","Version":"3.1.0","Type":"Delta","FileName":"CalliAPI-3.1.0-delta.nupkg","SHA1":"3F2DEDF7C2A1A0EB75A22AC5CD333257BF68A801","SHA256":"BA9ADC2F75DCF6020F18FEBC111733FD7CD5A67F54D84BB83E001013A32D99D4","Size":293360},{"PackageId":"CalliAPI","Version":"3.0.6","Type":"Full","FileName":"CalliAPI-3.0.6-full.nupkg","SHA1":"FEF83B79F156CAB8EA73A05293939D1EEB44E617","SHA256":"F538FE5B40063B95EDC72CD41472C49589FB6387DC917EB78A7682579385BEA0","Size":91435319},{"PackageId":"CalliAPI","Version":"3.0.6","Type":"Delta","FileName":"CalliAPI-3.0.6-delta.nupkg","SHA1":"B6DFB2B7E720BA5C57063A024CD5717D4B3DAE46","SHA256":"30B023EF556EB63FFEBF5F2A47E585B964B372CA0DAAB5C5394D4D2FD82C906C","Size":299970},{"PackageId":"CalliAPI","Version":"3.0.5","Type":"Full","FileName":"CalliAPI-3.0.5-full.nupkg","SHA1":"8EB6EFACB6B70ED1BD7045E1349A9907CC75831B","SHA256":"397AD678C8A6286885EA7E1BB81125864BBF75A8E19476E75C92FD8D9AF39777","Size":91415133},{"PackageId":"CalliAPI","Version":"3.0.5","Type":"Delta","FileName":"CalliAPI-3.0.5-delta.nupkg","SHA1":"01760A7A7D62B667CC20BA3DF7322E501EBFEC12","SHA256":"1C7239E808756BFF0F9CDE026DF60626B8F3C3D5FD8685B1D5602EE8D811D925","Size":252900},{"PackageId":"CalliAPI","Version":"3.0.4","Type":"Full","FileName":"CalliAPI-3.0.4-full.nupkg","SHA1":"506228721094BA7B3D920742892A35EBD995119D","SHA256":"2AF13BEC1A82B5BE6A618FB2176FE1E9219E45267D656AE995A33DE18A469818","Size":91415292},{"PackageId":"CalliAPI","Version":"3.0.4","Type":"Delta","FileName":"CalliAPI-3.0.4-delta.nupkg","SHA1":"64A5692473E204F850EF4413529EA0998CA48C24","SHA256":"55524D3CA2F7D7EDD14E3F8DF9C100E97B6F3D1FAB37FB21C8C4E4A35C4AAB8A","Size":245954},{"PackageId":"CalliAPI","Version":"3.0.3","Type":"Full","FileName":"CalliAPI-3.0.3-full.nupkg","SHA1":"BFE7488FC71E399CCFDEFF4223DEFA551A4D6DCD","SHA256":"DDB28FA6569EC09CB3471E744C9E679A84C87A087058AB7F223161749F50180A","Size":91415308},{"PackageId":"CalliAPI","Version":"3.0.3","Type":"Delta","FileName":"CalliAPI-3.0.3-delta.nupkg","SHA1":"AEE148D3A170910031155B40E4FDA7FAF602D116","SHA256":"5D8FF3ED50DF3BB45229A7350D05545725B9A965EEDFC61D3C33A3BDB75B479B","Size":293592},{"PackageId":"CalliAPI","Version":"3.0.2","Type":"Full","FileName":"CalliAPI-3.0.2-full.nupkg","SHA1":"F06F0214E47ACAA6FED838BCC362C251B16884B3","SHA256":"F31A2C3766D0095AE217CA83CF377857EF5256D3BBD0703E8475F8D6208CDDAF","Size":91412060},{"PackageId":"CalliAPI","Version":"3.0.2","Type":"Delta","FileName":"CalliAPI-3.0.2-delta.nupkg","SHA1":"6CDFEFAAD8EA85B5161982289515DE8169336BC2","SHA256":"C6C97EDA974EC0D543323B1135165ADBD43BC755852A3D8F1409FDFD488C9DD4","Size":280534},{"PackageId":"CalliAPI","Version":"3.0.1","Type":"Full","FileName":"CalliAPI-3.0.1-full.nupkg","SHA1":"29BB26A9194582A0219D845372D056BAFED70F88","SHA256":"E2CB6683326BC7E0BE243684D3F77ECBBC50A45A9DFCFFC069A7D162AB1F92EF","Size":91412513},{"PackageId":"CalliAPI","Version":"3.0.1","Type":"Delta","FileName":"CalliAPI-3.0.1-delta.nupkg","SHA1":"86F65C6444D27BFF929D929ABC5414C8A6D598D1","SHA256":"352070ED707BDD65640D1FA7CA29129DC6688542A062360AD8C3BCC3AA46CED2","Size":245652},{"PackageId":"CalliAPI","Version":"3.0.0","Type":"Full","FileName":"CalliAPI-3.0.0-full.nupkg","SHA1":"60598D6934EA9AD043A59DD4DD1DD30B2EDA8D2F","SHA256":"026F93967268BF5D33D1E76F1E81FC06367E535383BBB4C1CF43D00B6B5B2869","Size":91412517},{"PackageId":"CalliAPI","Version":"3.0.0","Type":"Delta","FileName":"CalliAPI-3.0.0-delta.nupkg","SHA1":"1124B466518DFE0C8C63CECEDCCF4069790E31B3","SHA256":"56D75B7846448E9FBEA9AD8539465F6602547EA6373322C4E9E9DAA6445C1A62","Size":282131},{"PackageId":"CalliAPI","Version":"2.1.1","Type":"Full","FileName":"CalliAPI-2.1.1-full.nupkg","SHA1":"71BECFFD27EC7F3E3FBFB00CB9A911D56B9BCD34","SHA256":"54C6B168078A673DFC9F534B81B6661F55DEB0D9586232445FD55382DDA92D93","Size":91413595},{"PackageId":"CalliAPI","Version":"2.1.1","Type":"Delta","FileName":"CalliAPI-2.1.1-delta.nupkg","SHA1":"BDEF0631223F6DB866691CFAECC76DBB68E07621","SHA256":"AD717414A62ED4A69F1EF3713BFE1EC9B852E5DDEB81AA05C617A372AD7B49AB","Size":245652},{"PackageId":"CalliAPI","Version":"2.1.0","Type":"Full","FileName":"CalliAPI-2.1.0-full.nupkg","SHA1":"9FE8C2E02081B613C54E9CAE46801531EDEF3BF6","SHA256":"501476E9971E536F13C139BE74B1C0632E920C5544F234912234F432FFFE47CE","Size":91413590},{"PackageId":"CalliAPI","Version":"2.1.0","Type":"Delta","FileName":"CalliAPI-2.1.0-delta.nupkg","SHA1":"94F2C684FF37542C139CE7F61E02664534B539A3","SHA256":"52BC8FCF4C718B6077B055B2868224AD53D1091B0BF218E6CA5F01EB134BB448","Size":245667},{"PackageId":"CalliAPI","Version":"2.0.7","Type":"Full","FileName":"CalliAPI-2.0.7-full.nupkg","SHA1":"CABAD19151C3DE9FF71B8AA59E0695244B5E0CD1","SHA256":"568FF352D4E7AC4DA0A83D23A1911EFCAD7DC68EDC7C7FF522EECF14DF25C057","Size":91413596},{"PackageId":"CalliAPI","Version":"2.0.7","Type":"Delta","FileName":"CalliAPI-2.0.7-delta.nupkg","SHA1":"76C26A0953180B959F53891D8FF8263E536B739A","SHA256":"1DE37DB41E10B90A333E6C4B8E8132ECB1F0DBEC0D43EA210798217D24E84B15","Size":245660},{"PackageId":"CalliAPI","Version":"2.0.6","Type":"Full","FileName":"CalliAPI-2.0.6-full.nupkg","SHA1":"047AEEDC11B30F6EA2C9B15185FC8890B749A497","SHA256":"EEC08DFE440F225F0DAAA7F9833C6D3EE5B08F9999C10F8910D33CDA9374E5F7","Size":91413592},{"PackageId":"CalliAPI","Version":"2.0.6","Type":"Delta","FileName":"CalliAPI-2.0.6-delta.nupkg","SHA1":"B6984979D6AED79001C80845254065AF00CF0447","SHA256":"3AC3DDAE406C3A392F76BC31382CBF02206B5F6A0E99F5C29ABB5C8954E3853A","Size":245640},{"PackageId":"CalliAPI","Version":"2.0.5","Type":"Full","FileName":"CalliAPI-2.0.5-full.nupkg","SHA1":"9DEF95D9724A4F900A55B12AFE8DBE6DB0EBABA1","SHA256":"B5AD53BBA2B53E80563669688602E11A11D5F4F79352C16F9EB5113B3C8CE000","Size":91413594},{"PackageId":"CalliAPI","Version":"2.0.5","Type":"Delta","FileName":"CalliAPI-2.0.5-delta.nupkg","SHA1":"4395A7715231F6274A7810FDB7DACBBE3B0D6195","SHA256":"A592BC4F22A98E0CBBB4C40C25DBF587D04E9877E47EBBE1A07A2B0C24E9219A","Size":246114},{"PackageId":"CalliAPI","Version":"2.0.4","Type":"Full","FileName":"CalliAPI-2.0.4-full.nupkg","SHA1":"720CC09BF045BE0C48B3EB0017B3FD2E96BCB430","SHA256":"FE4AD45397F921790ADA5AAE1D33C1865F1541ADC07C1364760BD9E50A6992DE","Size":91412857},{"PackageId":"CalliAPI","Version":"2.0.4","Type":"Delta","FileName":"CalliAPI-2.0.4-delta.nupkg","SHA1":"AE800E765AA2849492376BC7001C68658A23C262","SHA256":"D32E59A2F62DE862B217F00944BBB1D50CB3881D117DD1E328E61F2291D99051","Size":245355},{"PackageId":"CalliAPI","Version":"2.0.3","Type":"Full","FileName":"CalliAPI-2.0.3-full.nupkg","SHA1":"D1120D0BAEAB0B76421693BB2E6AF9AC8351990C","SHA256":"7C89837F2EDF0C63473D5A81D1346754A0C18EE020A62DB8C1633159E896C829","Size":91413578},{"PackageId":"CalliAPI","Version":"2.0.3","Type":"Delta","FileName":"CalliAPI-2.0.3-delta.nupkg","SHA1":"FD88915F8A16F8B955644BA1073545AB2B433F42","SHA256":"94BE5EC8F21B2F15BBCF1CC57068697BCE7DB5A991BBF547458ACF38E7FB927E","Size":245645},{"PackageId":"CalliAPI","Version":"2.0.2","Type":"Full","FileName":"CalliAPI-2.0.2-full.nupkg","SHA1":"CDAEA2AB5C095C453811A69B1527B82F90BCE98F","SHA256":"A8AD481664990CC0DADA8D5AA8BAEF42E9DEE180321D73278774C7765DE8340B","Size":91413578},{"PackageId":"CalliAPI","Version":"2.0.2","Type":"Delta","FileName":"CalliAPI-2.0.2-delta.nupkg","SHA1":"C97F8C202FDFB9A83C6626CA90F23A9CD0DBAF76","SHA256":"319CA763D7BFF4BBB122050DAAFB98056A896EA82D8AF6AEDBC092D0216D0CA7","Size":245405},{"PackageId":"CalliAPI","Version":"2.0.1","Type":"Full","FileName":"CalliAPI-2.0.1-full.nupkg","SHA1":"16A7BBFCD4349394023D1A3FB9D9160AB429BD51","SHA256":"0FBDF88622E00E2A97DBEFA78F70B62712821E2A907DB0C071E9EFDE15ACA543","Size":91413590},{"PackageId":"CalliAPI","Version":"2.0.1","Type":"Delta","FileName":"CalliAPI-2.0.1-delta.nupkg","SHA1":"FB28A814DBA475195A50CC4EE97DB4097BEF0687","SHA256":"05563F305D3A112D26ED411BB7F9FBEE9549729CF968C89311CF96F024CB87F1","Size":245857},{"PackageId":"CalliAPI","Version":"2.0.0","Type":"Full","FileName":"CalliAPI-2.0.0-full.nupkg","SHA1":"B2D26AE04E382CBF2FE366D27A0214288076C723","SHA256":"A062C6C578D8EDFF8FF7B4C6748E7FD0D5B21D73F61AB6E9D49F38B9EB0B48AB","Size":91412830}]}
+
+// File: UI\AuthorizationCodeForm.cs
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace CalliAPI.UI
+{
+    public partial class AuthorizationCodeForm : Form
+    {
+        public string AuthorizationCode => textBoxCode.Text;
+
+
+        public AuthorizationCodeForm()
+        {
+            InitializeComponent();
+            this.AcceptButton = btnOK;
+        }
+
+        private void label1_Click(object sender, EventArgs e)
+        {
+
+        }
+    }
+}
+
+
+// File: UI\AuthorizationCodeForm.Designer.cs
+namespace CalliAPI.UI
+{
+    partial class AuthorizationCodeForm
+    {
+        /// <summary>
+        /// Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary>
+        /// Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Windows Form Designer generated code
+
+        /// <summary>
+        /// Required method for Designer support - do not modify
+        /// the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            pictureBox1 = new PictureBox();
+            tableLayoutPanel1 = new TableLayoutPanel();
+            panel1 = new Panel();
+            label1 = new Label();
+            textBoxCode = new TextBox();
+            btnCancel = new Button();
+            btnOK = new Button();
+            label2 = new Label();
+            ((System.ComponentModel.ISupportInitialize)pictureBox1).BeginInit();
+            tableLayoutPanel1.SuspendLayout();
+            panel1.SuspendLayout();
+            SuspendLayout();
+            // 
+            // pictureBox1
+            // 
+            pictureBox1.Dock = DockStyle.Fill;
+            pictureBox1.Image = Properties.Resources.AllowAccess;
+            pictureBox1.Location = new Point(3, 3);
+            pictureBox1.Name = "pictureBox1";
+            pictureBox1.Size = new Size(750, 344);
+            pictureBox1.SizeMode = PictureBoxSizeMode.Zoom;
+            pictureBox1.TabIndex = 2;
+            pictureBox1.TabStop = false;
+            // 
+            // tableLayoutPanel1
+            // 
+            tableLayoutPanel1.ColumnCount = 1;
+            tableLayoutPanel1.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            tableLayoutPanel1.Controls.Add(pictureBox1, 0, 0);
+            tableLayoutPanel1.Controls.Add(panel1, 0, 1);
+            tableLayoutPanel1.Dock = DockStyle.Fill;
+            tableLayoutPanel1.Location = new Point(0, 0);
+            tableLayoutPanel1.Name = "tableLayoutPanel1";
+            tableLayoutPanel1.RowCount = 2;
+            tableLayoutPanel1.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            tableLayoutPanel1.RowStyles.Add(new RowStyle(SizeType.Absolute, 100F));
+            tableLayoutPanel1.Size = new Size(756, 450);
+            tableLayoutPanel1.TabIndex = 3;
+            // 
+            // panel1
+            // 
+            panel1.Controls.Add(label2);
+            panel1.Controls.Add(btnOK);
+            panel1.Controls.Add(btnCancel);
+            panel1.Controls.Add(textBoxCode);
+            panel1.Controls.Add(label1);
+            panel1.Dock = DockStyle.Fill;
+            panel1.Location = new Point(3, 353);
+            panel1.Name = "panel1";
+            panel1.Size = new Size(750, 94);
+            panel1.TabIndex = 3;
+            // 
+            // label1
+            // 
+            label1.Anchor = AnchorStyles.None;
+            label1.AutoSize = true;
+            label1.Location = new Point(36, 16);
+            label1.Name = "label1";
+            label1.Size = new Size(397, 15);
+            label1.TabIndex = 2;
+            label1.Text = "Please click Allow Access, then enter the authorization code from the URL:";
+            // 
+            // textBoxCode
+            // 
+            textBoxCode.Location = new Point(39, 46);
+            textBoxCode.Name = "textBoxCode";
+            textBoxCode.Size = new Size(403, 23);
+            textBoxCode.TabIndex = 3;
+            // 
+            // btnCancel
+            // 
+            btnCancel.BackColor = Color.MistyRose;
+            btnCancel.DialogResult = DialogResult.Cancel;
+            btnCancel.Location = new Point(543, 45);
+            btnCancel.Name = "btnCancel";
+            btnCancel.Size = new Size(105, 26);
+            btnCancel.TabIndex = 4;
+            btnCancel.Text = "Cancel";
+            btnCancel.UseVisualStyleBackColor = false;
+            // 
+            // btnOK
+            // 
+            btnOK.BackColor = Color.Lime;
+            btnOK.DialogResult = DialogResult.OK;
+            btnOK.Location = new Point(452, 46);
+            btnOK.Name = "btnOK";
+            btnOK.Size = new Size(91, 24);
+            btnOK.TabIndex = 5;
+            btnOK.Text = "OK";
+            btnOK.UseVisualStyleBackColor = false;
+            // 
+            // label2
+            // 
+            label2.AutoSize = true;
+            label2.Font = new Font("Segoe UI", 6.75F, FontStyle.Italic, GraphicsUnit.Point, 0);
+            label2.ForeColor = SystemColors.AppWorkspace;
+            label2.Location = new Point(39, 31);
+            label2.Name = "label2";
+            label2.Size = new Size(392, 12);
+            label2.TabIndex = 6;
+            label2.Text = "Lost the authorization code? Click Cancel, then click Connect to Clio again at the bottom of the screen.";
+            // 
+            // AuthorizationCodeForm
+            // 
+            AutoScaleDimensions = new SizeF(7F, 15F);
+            AutoScaleMode = AutoScaleMode.Font;
+            ClientSize = new Size(756, 450);
+            Controls.Add(tableLayoutPanel1);
+            Name = "AuthorizationCodeForm";
+            Text = "AuthorizationCodeForm";
+            ((System.ComponentModel.ISupportInitialize)pictureBox1).EndInit();
+            tableLayoutPanel1.ResumeLayout(false);
+            panel1.ResumeLayout(false);
+            panel1.PerformLayout();
+            ResumeLayout(false);
+        }
+
+        #endregion
+        private PictureBox pictureBox1;
+        private TableLayoutPanel tableLayoutPanel1;
+        private Panel panel1;
+        private Button btnCancel;
+        private TextBox textBoxCode;
+        private Label label1;
+        private Label label2;
+        private Button btnOK;
+    }
+}
+
+// File: UI\CustomReportBuilderForm.cs
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using CalliAPI.BusinessLogic;
+using CalliAPI.Interfaces;
+using CalliAPI.Models;
+using CalliAPI.UI.Controls;
+using CalliAPI.UI.Views;
+using CalliAPI.Utilities;
+using Task = System.Threading.Tasks.Task;
+
+namespace CalliAPI.UI
+{
+    public partial class CustomReportBuilderForm : Form
+    {
+        private readonly ClioService _clioService;
+        public CustomReportBuilderForm(ClioService clioService)
+        {
+            _clioService = clioService ?? throw new ArgumentNullException(nameof(clioService));
+            InitializeComponent();
+            // Initialize the content panel with controls
+            setView();
+
+        }
+
+        private void setView()
+        {
+            // Get the selected item from the combo box
+            string selectedItem = comboBox1.SelectedItem?.ToString();
+
+            // Prepare the appropriate View (in UI/Views) as well as the clioService if needed
+            UserControl view = selectedItem switch
+            {
+                "matters" => new MatterQueryControl(_clioService),
+                _ => null
+            };
+
+            if (view != null)
+            {
+                panelContent.Controls.Clear(); // Remove previous view
+                panelContent.Controls.Add(view); // Add new view
+                view.Dock = DockStyle.Fill; // Make it fill the panel
+            }
+        }
+
+        private void comboBox1_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            setView();
+        }
+
+        private async void btnSearch_Click(object sender, EventArgs e)
+        {
+            var activeControl = panelContent.Controls.OfType<Control>().FirstOrDefault();
+
+            if (activeControl is IQueryBuilder<Matter> matterBuilder)
+            {
+                //string fields = matterBuilder.SelectedFields;
+                //var filters = matterBuilder.SelectedFilters;
+
+                //IAsyncEnumerable<Matter> results = _clioService.GetAllMattersAsync(fields);
+
+                //foreach (var filter in filters)
+                //{
+                //    results = filter(results);
+                //}
+
+                //await ReportLauncher.ShowAsync(results);
+                await QueryExecutor.ExecuteAsync(matterBuilder, _clioService);
+            }
+            else if (activeControl is IQueryBuilder<CalliAPI.Models.Task> taskBuilder)
+            {
+                await QueryExecutor.ExecuteAsync(taskBuilder, _clioService);
+            }
+
+
+        }
+    }
+}
+
+
+// File: UI\CustomReportBuilderForm.Designer.cs
+namespace CalliAPI.UI
+{
+    partial class CustomReportBuilderForm
+    {
+        /// <summary>
+        /// Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary>
+        /// Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Windows Form Designer generated code
+
+        /// <summary>
+        /// Required method for Designer support - do not modify
+        /// the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            comboBox1 = new ComboBox();
+            label1 = new Label();
+            tableLayoutPanel1 = new TableLayoutPanel();
+            tableLayoutPanel2 = new TableLayoutPanel();
+            panel1 = new Panel();
+            panelContent = new Panel();
+            tableLayoutPanel1.SuspendLayout();
+            tableLayoutPanel2.SuspendLayout();
+            panel1.SuspendLayout();
+            SuspendLayout();
+            // 
+            // comboBox1
+            // 
+            comboBox1.FormattingEnabled = true;
+            comboBox1.Items.AddRange(new object[] { "matters" });
+            comboBox1.Location = new Point(3, 25);
+            comboBox1.Name = "comboBox1";
+            comboBox1.Size = new Size(121, 23);
+            comboBox1.TabIndex = 1;
+            comboBox1.Text = "matters";
+            comboBox1.SelectedIndexChanged += comboBox1_SelectedIndexChanged;
+            // 
+            // label1
+            // 
+            label1.AutoSize = true;
+            label1.Location = new Point(3, 7);
+            label1.Name = "label1";
+            label1.Size = new Size(58, 15);
+            label1.TabIndex = 2;
+            label1.Text = "Endpoint:";
+            // 
+            // tableLayoutPanel1
+            // 
+            tableLayoutPanel1.AutoSize = true;
+            tableLayoutPanel1.ColumnCount = 1;
+            tableLayoutPanel1.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            tableLayoutPanel1.Controls.Add(tableLayoutPanel2, 0, 0);
+            tableLayoutPanel1.Controls.Add(panelContent, 0, 1);
+            tableLayoutPanel1.Dock = DockStyle.Fill;
+            tableLayoutPanel1.Location = new Point(0, 0);
+            tableLayoutPanel1.Name = "tableLayoutPanel1";
+            tableLayoutPanel1.RowCount = 2;
+            tableLayoutPanel1.RowStyles.Add(new RowStyle(SizeType.Absolute, 75F));
+            tableLayoutPanel1.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            tableLayoutPanel1.Size = new Size(1097, 577);
+            tableLayoutPanel1.TabIndex = 3;
+            // 
+            // tableLayoutPanel2
+            // 
+            tableLayoutPanel2.ColumnCount = 2;
+            tableLayoutPanel2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            tableLayoutPanel2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            tableLayoutPanel2.Controls.Add(panel1, 0, 0);
+            tableLayoutPanel2.Dock = DockStyle.Fill;
+            tableLayoutPanel2.Location = new Point(3, 3);
+            tableLayoutPanel2.Name = "tableLayoutPanel2";
+            tableLayoutPanel2.RowCount = 1;
+            tableLayoutPanel2.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
+            tableLayoutPanel2.Size = new Size(1091, 69);
+            tableLayoutPanel2.TabIndex = 0;
+            // 
+            // panel1
+            // 
+            panel1.Controls.Add(label1);
+            panel1.Controls.Add(comboBox1);
+            panel1.Dock = DockStyle.Fill;
+            panel1.Location = new Point(3, 3);
+            panel1.Name = "panel1";
+            panel1.Size = new Size(539, 63);
+            panel1.TabIndex = 0;
+            // 
+            // panelContent
+            // 
+            panelContent.AutoSize = true;
+            panelContent.Dock = DockStyle.Fill;
+            panelContent.Location = new Point(3, 78);
+            panelContent.Name = "panelContent";
+            panelContent.Size = new Size(1091, 496);
+            panelContent.TabIndex = 2;
+            // 
+            // CustomReportBuilderForm
+            // 
+            AutoScaleDimensions = new SizeF(7F, 15F);
+            AutoScaleMode = AutoScaleMode.Font;
+            AutoSize = true;
+            ClientSize = new Size(1097, 577);
+            Controls.Add(tableLayoutPanel1);
+            Name = "CustomReportBuilderForm";
+            Text = "CustomReportBuilderForm";
+            tableLayoutPanel1.ResumeLayout(false);
+            tableLayoutPanel1.PerformLayout();
+            tableLayoutPanel2.ResumeLayout(false);
+            panel1.ResumeLayout(false);
+            panel1.PerformLayout();
+            ResumeLayout(false);
+            PerformLayout();
+        }
+
+        #endregion
+        private ComboBox comboBox1;
+        private Label label1;
+        private TableLayoutPanel tableLayoutPanel1;
+        private TableLayoutPanel tableLayoutPanel2;
+        private Panel panel1;
+        private Panel panelContent;
+    }
+}
+
+// File: UI\DatePickerForm.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace CalliAPI.UI
+{
+
+
+    public class DatePickerDialog : Form
+    {
+        public DateTime SelectedDate => dateTimePicker.Value;
+
+        private DateTimePicker dateTimePicker;
+
+        public DatePickerDialog(int MaxLookbackDays)
+        {
+            dateTimePicker = new DateTimePicker
+            {
+                Dock = DockStyle.Fill,
+                MinDate = DateTime.Today.AddDays(-MaxLookbackDays),
+                MaxDate = DateTime.Today,
+                Value = DateTime.Today.AddDays(-MaxLookbackDays)
+            };
+
+            var okButton = new Button { Text = "OK", DialogResult = DialogResult.OK };
+            var cancelButton = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel };
+
+            var buttonPanel = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Bottom,
+                FlowDirection = FlowDirection.RightToLeft,
+                Controls = { okButton, cancelButton }
+            };
+
+            Controls.Add(dateTimePicker);
+            Controls.Add(buttonPanel);
+
+            AcceptButton = okButton;
+            CancelButton = cancelButton;
+        }
+    }
+
+
+}
+
+
+// File: UI\MailerForm.cs
+/*
+ * CalliAPI Mailer
+ * 2025 Mar 28
+ * Jacob Hayes
+ * The goal of this program is as follows:
+ *  * A Webhook listens for any Clio documents being commented on.
+ *  * When a document is commented on, either "mail" or "cancel", it will update the database.
+ *  * This program has a DataGridView that displays the current status of all documents in the database.
+ *  * In MailerForm_Load(), we add a button column to the DataGridView that allows us to print the document.
+ *  
+ *  P.S. - Calliope is the head of the Greek Muses, of whom Clio is one. I figured it was the perfect name to handle all our API requests from Clio,
+ *  especially since the name CalliAPI was right there.
+ */
+
+using MaterialSkin;
+using MaterialSkin.Controls;
+using Microsoft.Data.SqlClient;
+
+namespace CalliAPI
+{
+    public partial class MailerForm : MaterialForm
+    {
+        
+        private static readonly string connectionString = "";
+        private static readonly string querySelectAll = "SELECT * FROM Documents";
+
+        public MailerForm()
+        {
+            InitializeComponent();
+
+            var materialSkinManager = MaterialSkinManager.Instance;
+            materialSkinManager.AddFormToManage(this);
+            materialSkinManager.Theme = MaterialSkinManager.Themes.LIGHT;
+            materialSkinManager.ColorScheme = new ColorScheme(Primary.BlueGrey800, Primary.BlueGrey900, Primary.BlueGrey500, Accent.LightBlue200, TextShade.WHITE);
+        }
+
+        private void Form1_Load(object sender, EventArgs e)
+        {
+            // Create a new button column
+            DataGridViewButtonColumn printButtonColumn = new DataGridViewButtonColumn();
+            printButtonColumn.Name = "PrintButton";
+            printButtonColumn.HeaderText = "Print";
+            printButtonColumn.Text = "Print";
+            printButtonColumn.UseColumnTextForButtonValue = true;
+
+            // Create a new ignore button column
+            DataGridViewButtonColumn ignoreButtonColumn = new DataGridViewButtonColumn();
+            ignoreButtonColumn.Name = "IgnoreButton";
+            ignoreButtonColumn.HeaderText = "Ignore";
+            ignoreButtonColumn.Text = "Ignore";
+            ignoreButtonColumn.UseColumnTextForButtonValue = true;
+
+            // Create a flag button to flag documented issues
+
+            // Add the new columns to the DataGridView
+            dataGridView1.Columns.Add(printButtonColumn);
+            dataGridView1.Columns.Add(ignoreButtonColumn);
+
+            
+        }
+
+
+        /// <summary>
+        /// This function checks to see if the user has clicked on the Print or Ignore buttons in the database, and updates the items inside as needed.
+        /// </summary>
+        private void dataGridView1_CellClick(object sender, DataGridViewCellEventArgs e)
+        {
+            // Check if the clicked cell is a button cell
+
+            if (e.ColumnIndex == dataGridView1.Columns["PrintButton"].Index && e.RowIndex >= 0)
+            {
+                // Get the data from the selected row
+                var selectedRow = dataGridView1.Rows[e.RowIndex];
+                string documentId = selectedRow.Cells["DocumentID"].Value.ToString();
+
+                // Call the print method
+                PrintDocument(documentId);
+            }
+            else if (e.ColumnIndex == dataGridView1.Columns["IgnoreButton"].Index && e.RowIndex >= 0)
+            {
+                // Handle the ignore button click
+                var selectedRow = dataGridView1.Rows[e.RowIndex];
+                var documentId = selectedRow.Cells["DocumentID"].Value.ToString();
+
+                // Call the ignore method
+                IgnoreDocument(documentId);
+            }
+        }
+
+        private void IgnoreDocument(string documentId)
+        {
+            MessageBox.Show("Ignoring document with ID: " + documentId);
+            //throw new NotImplementedException();
+        }
+
+        private void PrintDocument(string documentId)
+        {
+            MessageBox.Show("Printing document with ID: " + documentId);
+            //throw new NotImplementedException();
+        }
+
+        /// <summary>
+        /// Called whenever any checkbox state is changed, UpdateGrid will update the grid with the new state of the checkboxes.
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void UpdateGrid(object sender, EventArgs e)
+        {
+
+        }
+    }
+}
+
+
+// File: UI\MailerForm.Designer.cs
+namespace CalliAPI
+{
+    partial class MailerForm
+    {
+        /// <summary>
+        ///  Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary>
+        ///  Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Windows Form Designer generated code
+
+        /// <summary>
+        ///  Required method for Designer support - do not modify
+        ///  the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            dataGridView1 = new DataGridView();
+            chkShowPrinted = new CheckBox();
+            chkShowIgnored = new CheckBox();
+            chkShowCancelled = new CheckBox();
+            ((System.ComponentModel.ISupportInitialize)dataGridView1).BeginInit();
+            SuspendLayout();
+            // 
+            // dataGridView1
+            // 
+            dataGridView1.AllowUserToAddRows = false;
+            dataGridView1.AllowUserToDeleteRows = false;
+            dataGridView1.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize;
+            dataGridView1.Location = new Point(12, 136);
+            dataGridView1.Name = "dataGridView1";
+            dataGridView1.ReadOnly = true;
+            dataGridView1.Size = new Size(1486, 745);
+            dataGridView1.TabIndex = 0;
+            dataGridView1.CellClick += dataGridView1_CellClick;
+            // 
+            // chkShowPrinted
+            // 
+            chkShowPrinted.AutoSize = true;
+            chkShowPrinted.Location = new Point(12, 111);
+            chkShowPrinted.Name = "chkShowPrinted";
+            chkShowPrinted.Size = new Size(139, 19);
+            chkShowPrinted.TabIndex = 1;
+            chkShowPrinted.Text = "Show Already Printed";
+            chkShowPrinted.UseVisualStyleBackColor = true;
+            chkShowPrinted.CheckedChanged += UpdateGrid;
+            // 
+            // chkShowIgnored
+            // 
+            chkShowIgnored.AutoSize = true;
+            chkShowIgnored.Checked = true;
+            chkShowIgnored.CheckState = CheckState.Checked;
+            chkShowIgnored.Location = new Point(12, 71);
+            chkShowIgnored.Name = "chkShowIgnored";
+            chkShowIgnored.Size = new Size(99, 19);
+            chkShowIgnored.TabIndex = 2;
+            chkShowIgnored.Text = "Show Ignored";
+            chkShowIgnored.UseVisualStyleBackColor = true;
+            chkShowIgnored.CheckedChanged += UpdateGrid;
+            // 
+            // chkShowCancelled
+            // 
+            chkShowCancelled.AutoSize = true;
+            chkShowCancelled.Location = new Point(12, 91);
+            chkShowCancelled.Name = "chkShowCancelled";
+            chkShowCancelled.Size = new Size(110, 19);
+            chkShowCancelled.TabIndex = 3;
+            chkShowCancelled.Text = "Show Cancelled";
+            chkShowCancelled.UseVisualStyleBackColor = true;
+            chkShowCancelled.CheckedChanged += UpdateGrid;
+            // 
+            // Form1
+            // 
+            AutoScaleDimensions = new SizeF(7F, 15F);
+            AutoScaleMode = AutoScaleMode.Font;
+            ClientSize = new Size(1834, 918);
+            Controls.Add(chkShowCancelled);
+            Controls.Add(chkShowIgnored);
+            Controls.Add(chkShowPrinted);
+            Controls.Add(dataGridView1);
+            Name = "Form1";
+            Text = "CalliAPI Mailer Program";
+            Load += Form1_Load;
+            ((System.ComponentModel.ISupportInitialize)dataGridView1).EndInit();
+            ResumeLayout(false);
+            PerformLayout();
+        }
+
+        #endregion
+
+        private DataGridView dataGridView1;
+        private CheckBox chkShowPrinted;
+        private CheckBox chkShowIgnored;
+        private CheckBox chkShowCancelled;
+    }
+}
+
+
+// File: UI\MainForm.cs
+/* MainForm.cs
+ * Jacob Hayes
+ * 2025 04 21
+ */
+
+using CalliAPI.Models;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks; // for async
+using System.Windows.Forms;
+using CalliAPI.Interfaces;
+using CalliAPI.BusinessLogic;
+using CalliAPI.UI;
+using Task = System.Threading.Tasks.Task;
+using AmourgisCOREServices;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement;
+using CalliAPI.UI.Views;
+using CalliAPI.Utilities;
+using CalliAPI.UI.Controls;
+using Microsoft.Win32;
+using DocumentFormat.OpenXml.Bibliography;
+using System.Net;
+using System.Reflection;
+
+namespace CalliAPI
+{
+    public partial class MainForm : Form, IReportContext
+    {
+        private readonly ClioService _clioService; // for calling the API
+        private readonly AMO_Logger _logger;
+        private static readonly int MaxLookbackDays = 300; // for picking FastFetch start date
+        private DateTime _lastUpdate = DateTime.MinValue; // for updating the progress bar only if a certain amount of time has passed
+        private int _lastPercent = -1; // for updating the progress bar only if it's actually changed
+
+        public void SetReportName(string name) { lblReportName.Text = name; }
+
+        internal MainForm(ClioService clioService, AMO_Logger logger)
+        {
+
+            _clioService = clioService;
+            _logger = logger;
+            InitializeComponent();
+
+            this.Text = VersionHelper.GetDisplayVersion();
+            lblVersion.Text = VersionHelper.GetFormattedVersion();
+
+
+
+            clioService.ProgressUpdated += (current, total) =>
+            {
+                SetProgress(current, total);
+            };
+
+        }
+
+        public async Task SetProgress(int current, int total)
+        {
+            if (total <= 0)
+            {
+                progressBarPagesRetrieved.Value = 0;
+                UpdateReportLabel("No pages to retrieve.");
+                return;
+            }
+
+
+
+            int percent = Math.Min(100, (int)((current / (double)total) * 100));
+            progressBarPagesRetrieved.Maximum = 100;
+            await AnimateProgressBarAsync(percent);
+            UpdateReportLabel($"Page {current} of {total} obtained from Clio.");
+        }
+
+
+        /// <summary>
+        /// This method animates the progress bar to smoothly transition to the target value.
+        /// </summary>
+        /// <param name="targetValue"></param>
+        /// <returns></returns>
+        private async Task AnimateProgressBarAsync(int targetValue)
+        {
+            int start = progressBarPagesRetrieved.Value;
+            int duration = 500; // milliseconds
+            int steps = 30;
+
+            for (int i = 0; i <= steps; i++)
+            {
+                double t = i / (double)steps;
+                // Ease-out cubic: t = 1 - (1 - t)^3
+                double eased = 1 - Math.Pow(1 - t, 3);
+                int value = start + (int)((targetValue - start) * eased);
+                progressBarPagesRetrieved.Value = Math.Min(progressBarPagesRetrieved.Maximum, value);
+                await Task.Delay(duration / steps);
+            }
+        }
+
+
+        private void UpdateReportLabel(string text)
+        {
+            lblReportPageRetrieved.Text = text;
+            lblReportPageRetrieved.AutoSize = true;
+
+
+
+            // Clamp the left side
+            int newLeft = progressBarPagesRetrieved.Right - lblReportPageRetrieved.Width;
+
+            // Reposition the label so its right edge aligns with the progress bar's right edge
+            lblReportPageRetrieved.Left = Math.Max(progressBarPagesRetrieved.Left, newLeft);
+            lblReportPageRetrieved.Top = progressBarPagesRetrieved.Top + 2; // Adjust as needed
+        }
+
+        /// <summary>
+        /// This method is called when the "Open Mailer Form" button is clicked. Opens a new MailerForm.
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void btnOpenMailerForm_Click(object sender, EventArgs e)
+        {
+            openNewMailer();
+
+        }
+
+        private void exitToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            this.Close();
+        }
+
+
+        private void openNewMailer()
+        {
+            var mailerForm = new MailerForm();
+
+            mailerForm.Show();
+        }
+
+        private void openToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            openNewMailer();
+        }
+
+
+        private async void UpdateClioAPIStatus()
+        {
+            try
+            {
+                Cursor.Current = Cursors.WaitCursor;
+                HttpResponseMessage status = await _clioService.VerifyAPI();
+                lblClioAPIStatus.Text = status.IsSuccessStatusCode
+                    ? "Clio API Status: Connected"
+                    : $"Clio API Status: Error {status.StatusCode}";
+            }
+            finally
+            {
+                Cursor.Current = Cursors.Default;
+            }
+        }
+
+        private void lblClioAPIStatus_Click(object sender, EventArgs e)
+        {
+            UpdateClioAPIStatus();
+        }
+
+
+        private async void allMattersToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            _logger.Info("Report Start: All Matters");
+            lblReportName.Text = "Report: All Matters";
+            try
+            {
+                Cursor.Current = Cursors.WaitCursor;
+                await _clioService.GetAllMattersAsync(); // or whatever method you're calling
+            }
+            finally
+            {
+                Cursor.Current = Cursors.Default;
+            }
+
+        }
+
+        /// <summary>
+        /// This method is called when the "Connect to Clio" button is clicked. It starts the OAuth process to allow for authorized API calls to Clio. The user will be prompted to enter the authorization code after authorizing the app in the browser,
+        /// and the resulting access token will be stored in the authService.
+        /// </summary>
+        private async Task<bool> StartOAuthProcess()
+        {
+            _logger.Info("Starting OAuth process...");
+            // Open a browser and make the front-end OAuth call in the URL
+            var authorizationUrl = _clioService.GetAuthorizationUrl();
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = authorizationUrl,
+                UseShellExecute = true
+            };
+
+            MessageBox.Show("Please authorize the application in the browser that opens. After authorization, you will be redirected to a URL. Copy the authorization code from that URL and paste it into the input box that will appear.",
+            "Authorization", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+            System.Diagnostics.Process.Start(psi);
+
+
+            // Wait for the user to enter the authorization code correctly
+
+            string authorizationCode = string.Empty;
+
+            while (true)
+            {
+                using (var form = new AuthorizationCodeForm())
+                {
+                    var result = form.ShowDialog();
+
+                    if (result == DialogResult.Cancel)
+                    {
+                        MessageBox.Show("Authorization cancelled.", "Cancelled", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return false;
+                    }
+
+                    authorizationCode = _clioService.ValidateAuthorizationCode(form.AuthorizationCode);
+
+                    if (!string.IsNullOrEmpty(authorizationCode))
+                        break;
+
+                    MessageBox.Show("Invalid authorization code. Please try again.", "Invalid Input", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+
+
+            await _clioService.GetAccessTokenAsync(authorizationCode);
+            MessageBox.Show("Access Token successfully obtained!");
+            return true;
+
+        }
+
+        private async void all713MattersToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            lblReportName.Text = "Report: All Open 7 & 13 Matters";
+            await _clioService.GetAllOpen713Matters();
+        }
+
+        private async void allUnworked7And13MattersToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            lblReportName.Text = "Report: All Unworked 7 & 13 Matters";
+            await _clioService.GetUnworked713Matters();
+        }
+
+        private void treeViewReports_AfterSelect(object sender, TreeViewEventArgs e)
+        {
+            // Grab the selected node and check if it has a tag
+            if (e.Node.Tag is string viewName)
+            {
+
+                // Prepare the appropriate View (in UI/Views) as well as the clioService if needed
+                UserControl view = viewName switch
+                {
+                    "Reports" => new ReportsView(),
+                    "ReportsOpenMattersUnworkedMatters" => new ReportsOpenMattersUnworkedMatters(_clioService),
+                    "FastFetchCreatedSince" => new FastFetchCreatedSinceView(_clioService, this),
+                    _ => null
+                };
+
+                if (view != null)
+                {
+                    panelContent.Controls.Clear(); // Remove previous view
+                    panelContent.Controls.Add(view); // Add new view
+                    view.Dock = DockStyle.Fill; // Make it fill the panel
+                }
+            }
+
+        }
+
+        private async void toolStripBtnConnectToClio_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                int attempt = 0;
+                int maxAttempts = 5; // Set the maximum number of attempts
+                lblClioAPIStatus.Text = "Attempting to connect to Clio API...";
+                Cursor.Current = Cursors.WaitCursor;
+                // Start the OAuth process and get the access token
+                bool userAuthorized = await StartOAuthProcess();
+
+                if (userAuthorized)
+                {
+
+                    HttpResponseMessage httpResponse = await _clioService.VerifyAPI();
+
+                    while (!httpResponse.IsSuccessStatusCode)
+                    {
+                        attempt++;
+                        Thread.Sleep(3000);
+                        httpResponse = await _clioService.VerifyAPI();
+
+                        _logger.Info($"Attempt {attempt} of {maxAttempts} to connect to Clio API. Status: {httpResponse.StatusCode}. {await httpResponse.Content.ReadAsStringAsync()}");
+                        if (httpResponse.IsSuccessStatusCode)
+                        {
+                            lblClioAPIStatus.Text = "Clio API Status: Connected";
+                            MessageBox.Show("Successfully connected to Clio API!", "Connection Successful", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                            break;
+                        }
+                        lblClioAPIStatus.Text = $"Attempt {attempt} of {maxAttempts} to connect to Clio API failed: {httpResponse.StatusCode}.";
+                        if (attempt >= maxAttempts) throw new Exception(httpResponse.ReasonPhrase);
+                    }
+
+                    UpdateClioAPIStatus();
+                }
+                else
+                {
+                    lblClioAPIStatus.Text = "Authorization cancelled or failed.";
+                    MessageBox.Show("Authorization was cancelled or failed. Please try again.", "Authorization Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+            catch (Exception ex)
+            {
+                lblClioAPIStatus.Text = "Error connecting to Clio API.";
+                MessageBox.Show($"An error occurred while connecting to the Clio API: {ex.Message}", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                Cursor.Current = Cursors.Default;
+            }
+        }
+
+        private async void checkForUpdatesToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                MessageBox.Show("Checking for updates... This may take a moment.");
+                Cursor.Current = Cursors.WaitCursor;
+                await VersionHelper.UpdateCalliAPI();
+                MessageBox.Show("Update check complete. If an update was found, it has been applied. Please restart the application to see the changes.", "Update Check Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"An error occurred while checking for updates: {ex.Message}", "Update Check Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                Cursor.Current = Cursors.Default;
+            }
+        }
+
+        private async void Debug100Percent(object sender, EventArgs e)
+        {
+            for (int x = 1; x < 100; x++)
+            {
+                await Task.Delay(100); // non-blocking delay
+                SetProgress(x, 100);
+            }
+        }
+
+        private void resetRegistryKeyToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            if (MessageBox.Show("Are you sure you want to clear the Clio Client Secret from the registry? This will require you to reauthorize the application.", "Confirm Clear Client Secret", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                if (MessageBox.Show("This will clear the Clio Client Secret from the registry. Are you sure?", "Confirm Clear Client Secret", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                    ClearClientSecretFromRegistry();
+        }
+
+
+        public static void ClearClientSecretFromRegistry()
+        {
+            RegistryKey key = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\CalliAPI", writable: true);
+            key?.DeleteValue("ClioClientSecret", false);
+        }
+
+        private void customReportBuilderToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            CustomReportBuilderForm customReportBuilderForm = new CustomReportBuilderForm(_clioService);
+            customReportBuilderForm.Show();
+        }
+
+        private void manifestResourceListToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            string result = "";
+            var names = Assembly.GetExecutingAssembly().GetManifestResourceNames();
+            foreach (var name in names)
+                result += ("\n" + name);
+
+            MessageBox.Show(result, "Manifest Resource Names", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+        }
+    }
+}
+
+
+// File: UI\MainForm.Designer.cs
+using CalliAPI.UI.Controls;
+
+namespace CalliAPI
+{
+    partial class MainForm
+    {
+        /// <summary>
+        /// Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary>
+        /// Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Windows Form Designer generated code
+
+        /// <summary>
+        /// Required method for Designer support - do not modify
+        /// the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            System.ComponentModel.ComponentResourceManager resources = new System.ComponentModel.ComponentResourceManager(typeof(MainForm));
+            TreeNode treeNode1 = new TreeNode("Unworked Matters");
+            TreeNode treeNode2 = new TreeNode("Open Matters", new TreeNode[] { treeNode1 });
+            TreeNode treeNode3 = new TreeNode("All Matters");
+            TreeNode treeNode4 = new TreeNode("Reports", new TreeNode[] { treeNode2, treeNode3 });
+            TreeNode treeNode5 = new TreeNode("All Created Since");
+            TreeNode treeNode6 = new TreeNode("FastFetch", new TreeNode[] { treeNode5 });
+            menuStrip1 = new MenuStrip();
+            fileToolStripMenuItem = new ToolStripMenuItem();
+            checkForUpdatesToolStripMenuItem = new ToolStripMenuItem();
+            exitToolStripMenuItem = new ToolStripMenuItem();
+            resetRegistryKeyToolStripMenuItem = new ToolStripMenuItem();
+            programToolStripMenuItem = new ToolStripMenuItem();
+            mailerProgramToolStripMenuItem = new ToolStripMenuItem();
+            openToolStripMenuItem = new ToolStripMenuItem();
+            debugToolStripMenuItem = new ToolStripMenuItem();
+            toolStripMenuItem2 = new ToolStripMenuItem();
+            manifestResourceListToolStripMenuItem = new ToolStripMenuItem();
+            customReportBuilderToolStripMenuItem = new ToolStripMenuItem();
+            reportsToolStripMenuItem = new ToolStripMenuItem();
+            allMattersToolStripMenuItem = new ToolStripMenuItem();
+            all713MattersToolStripMenuItem = new ToolStripMenuItem();
+            allUnworked7And13MattersToolStripMenuItem = new ToolStripMenuItem();
+            statusStrip1 = new StatusStrip();
+            lblApiStatus = new ToolStripStatusLabel();
+            lblClioAPIStatus = new ToolStripStatusLabel();
+            toolStripBtnConnectToClio = new ToolStripStatusLabel();
+            progressBarPagesRetrieved = new ProgressBarWithText();
+            lblReportPageRetrieved = new Label();
+            lblReportName = new Label();
+            textBox1 = new TextBox();
+            splitContainer1 = new SplitContainer();
+            treeViewReports = new TreeView();
+            panelContent = new Panel();
+            panel1 = new Panel();
+            lblVersion = new Label();
+            tableLayoutPanel1 = new TableLayoutPanel();
+            menuStrip1.SuspendLayout();
+            statusStrip1.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)splitContainer1).BeginInit();
+            splitContainer1.Panel1.SuspendLayout();
+            splitContainer1.Panel2.SuspendLayout();
+            splitContainer1.SuspendLayout();
+            panel1.SuspendLayout();
+            tableLayoutPanel1.SuspendLayout();
+            SuspendLayout();
+            // 
+            // menuStrip1
+            // 
+            menuStrip1.Items.AddRange(new ToolStripItem[] { fileToolStripMenuItem, programToolStripMenuItem, reportsToolStripMenuItem });
+            menuStrip1.Location = new Point(0, 0);
+            menuStrip1.Name = "menuStrip1";
+            menuStrip1.Size = new Size(1184, 24);
+            menuStrip1.TabIndex = 1;
+            menuStrip1.Text = "menuStrip1";
+            // 
+            // fileToolStripMenuItem
+            // 
+            fileToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { checkForUpdatesToolStripMenuItem, exitToolStripMenuItem, resetRegistryKeyToolStripMenuItem });
+            fileToolStripMenuItem.Name = "fileToolStripMenuItem";
+            fileToolStripMenuItem.Size = new Size(37, 20);
+            fileToolStripMenuItem.Text = "File";
+            // 
+            // checkForUpdatesToolStripMenuItem
+            // 
+            checkForUpdatesToolStripMenuItem.Name = "checkForUpdatesToolStripMenuItem";
+            checkForUpdatesToolStripMenuItem.Size = new Size(171, 22);
+            checkForUpdatesToolStripMenuItem.Text = "Check for Updates";
+            checkForUpdatesToolStripMenuItem.Click += checkForUpdatesToolStripMenuItem_Click;
+            // 
+            // exitToolStripMenuItem
+            // 
+            exitToolStripMenuItem.Name = "exitToolStripMenuItem";
+            exitToolStripMenuItem.Size = new Size(171, 22);
+            exitToolStripMenuItem.Text = "Exit";
+            exitToolStripMenuItem.Click += exitToolStripMenuItem_Click;
+            // 
+            // resetRegistryKeyToolStripMenuItem
+            // 
+            resetRegistryKeyToolStripMenuItem.Name = "resetRegistryKeyToolStripMenuItem";
+            resetRegistryKeyToolStripMenuItem.Size = new Size(171, 22);
+            resetRegistryKeyToolStripMenuItem.Text = "Reset Registry Key";
+            resetRegistryKeyToolStripMenuItem.Click += resetRegistryKeyToolStripMenuItem_Click;
+            // 
+            // programToolStripMenuItem
+            // 
+            programToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { mailerProgramToolStripMenuItem, debugToolStripMenuItem, customReportBuilderToolStripMenuItem });
+            programToolStripMenuItem.Name = "programToolStripMenuItem";
+            programToolStripMenuItem.Size = new Size(65, 20);
+            programToolStripMenuItem.Text = "Program";
+            // 
+            // mailerProgramToolStripMenuItem
+            // 
+            mailerProgramToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { openToolStripMenuItem });
+            mailerProgramToolStripMenuItem.Name = "mailerProgramToolStripMenuItem";
+            mailerProgramToolStripMenuItem.Size = new Size(194, 22);
+            mailerProgramToolStripMenuItem.Text = "Mailer Program";
+            // 
+            // openToolStripMenuItem
+            // 
+            openToolStripMenuItem.Enabled = false;
+            openToolStripMenuItem.Name = "openToolStripMenuItem";
+            openToolStripMenuItem.Size = new Size(103, 22);
+            openToolStripMenuItem.Text = "Open";
+            openToolStripMenuItem.Click += openToolStripMenuItem_Click;
+            // 
+            // debugToolStripMenuItem
+            // 
+            debugToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { toolStripMenuItem2, manifestResourceListToolStripMenuItem });
+            debugToolStripMenuItem.Name = "debugToolStripMenuItem";
+            debugToolStripMenuItem.Size = new Size(194, 22);
+            debugToolStripMenuItem.Text = "Debug";
+            // 
+            // toolStripMenuItem2
+            // 
+            toolStripMenuItem2.Name = "toolStripMenuItem2";
+            toolStripMenuItem2.Size = new Size(192, 22);
+            toolStripMenuItem2.Text = "100%";
+            toolStripMenuItem2.Click += Debug100Percent;
+            // 
+            // manifestResourceListToolStripMenuItem
+            // 
+            manifestResourceListToolStripMenuItem.Name = "manifestResourceListToolStripMenuItem";
+            manifestResourceListToolStripMenuItem.Size = new Size(192, 22);
+            manifestResourceListToolStripMenuItem.Text = "Manifest Resource List";
+            manifestResourceListToolStripMenuItem.Click += manifestResourceListToolStripMenuItem_Click;
+            // 
+            // customReportBuilderToolStripMenuItem
+            // 
+            customReportBuilderToolStripMenuItem.Name = "customReportBuilderToolStripMenuItem";
+            customReportBuilderToolStripMenuItem.Size = new Size(194, 22);
+            customReportBuilderToolStripMenuItem.Text = "Custom Report Builder";
+            customReportBuilderToolStripMenuItem.Click += customReportBuilderToolStripMenuItem_Click;
+            // 
+            // reportsToolStripMenuItem
+            // 
+            reportsToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { allMattersToolStripMenuItem, all713MattersToolStripMenuItem, allUnworked7And13MattersToolStripMenuItem });
+            reportsToolStripMenuItem.Name = "reportsToolStripMenuItem";
+            reportsToolStripMenuItem.Size = new Size(59, 20);
+            reportsToolStripMenuItem.Text = "Reports";
+            // 
+            // allMattersToolStripMenuItem
+            // 
+            allMattersToolStripMenuItem.Name = "allMattersToolStripMenuItem";
+            allMattersToolStripMenuItem.Size = new Size(235, 22);
+            allMattersToolStripMenuItem.Text = "All Matters";
+            allMattersToolStripMenuItem.Click += allMattersToolStripMenuItem_Click;
+            // 
+            // all713MattersToolStripMenuItem
+            // 
+            all713MattersToolStripMenuItem.Name = "all713MattersToolStripMenuItem";
+            all713MattersToolStripMenuItem.Size = new Size(235, 22);
+            all713MattersToolStripMenuItem.Text = "All Open 7 & 13 Matters";
+            all713MattersToolStripMenuItem.Click += all713MattersToolStripMenuItem_Click;
+            // 
+            // allUnworked7And13MattersToolStripMenuItem
+            // 
+            allUnworked7And13MattersToolStripMenuItem.Name = "allUnworked7And13MattersToolStripMenuItem";
+            allUnworked7And13MattersToolStripMenuItem.Size = new Size(235, 22);
+            allUnworked7And13MattersToolStripMenuItem.Text = "All Unworked 7 and 13 Matters";
+            allUnworked7And13MattersToolStripMenuItem.Click += allUnworked7And13MattersToolStripMenuItem_Click;
+            // 
+            // statusStrip1
+            // 
+            statusStrip1.Items.AddRange(new ToolStripItem[] { lblApiStatus, lblClioAPIStatus, toolStripBtnConnectToClio });
+            statusStrip1.Location = new Point(0, 539);
+            statusStrip1.Name = "statusStrip1";
+            statusStrip1.Size = new Size(1184, 22);
+            statusStrip1.TabIndex = 2;
+            statusStrip1.Text = "statusStrip1";
+            // 
+            // lblApiStatus
+            // 
+            lblApiStatus.Name = "lblApiStatus";
+            lblApiStatus.Size = new Size(87, 17);
+            lblApiStatus.Text = "Clio API Status:";
+            // 
+            // lblClioAPIStatus
+            // 
+            lblClioAPIStatus.Name = "lblClioAPIStatus";
+            lblClioAPIStatus.Size = new Size(80, 17);
+            lblClioAPIStatus.Text = "Not Initialized";
+            lblClioAPIStatus.Click += lblClioAPIStatus_Click;
+            // 
+            // toolStripBtnConnectToClio
+            // 
+            toolStripBtnConnectToClio.BackColor = SystemColors.ButtonShadow;
+            toolStripBtnConnectToClio.Font = new Font("Segoe UI", 9F, FontStyle.Bold, GraphicsUnit.Point, 0);
+            toolStripBtnConnectToClio.ForeColor = SystemColors.HotTrack;
+            toolStripBtnConnectToClio.Image = (Image)resources.GetObject("toolStripBtnConnectToClio.Image");
+            toolStripBtnConnectToClio.ImageTransparentColor = Color.Magenta;
+            toolStripBtnConnectToClio.Name = "toolStripBtnConnectToClio";
+            toolStripBtnConnectToClio.Size = new Size(107, 17);
+            toolStripBtnConnectToClio.Text = "Connect to Clio";
+            toolStripBtnConnectToClio.Click += toolStripBtnConnectToClio_Click;
+            // 
+            // progressBarPagesRetrieved
+            // 
+            progressBarPagesRetrieved.ForeColor = Color.FromArgb(162, 188, 214);
+            progressBarPagesRetrieved.Location = new Point(13, 28);
+            progressBarPagesRetrieved.Name = "progressBarPagesRetrieved";
+            progressBarPagesRetrieved.Size = new Size(829, 23);
+            progressBarPagesRetrieved.TabIndex = 3;
+            // 
+            // lblReportPageRetrieved
+            // 
+            lblReportPageRetrieved.AutoSize = true;
+            lblReportPageRetrieved.Font = new Font("Cinzel", 9F);
+            lblReportPageRetrieved.Location = new Point(743, 9);
+            lblReportPageRetrieved.Name = "lblReportPageRetrieved";
+            lblReportPageRetrieved.Size = new Size(122, 14);
+            lblReportPageRetrieved.TabIndex = 4;
+            lblReportPageRetrieved.Text = "Report Progress...";
+            lblReportPageRetrieved.TextAlign = ContentAlignment.MiddleRight;
+            // 
+            // lblReportName
+            // 
+            lblReportName.AutoSize = true;
+            lblReportName.Font = new Font("Cinzel", 9F);
+            lblReportName.Location = new Point(13, 10);
+            lblReportName.Name = "lblReportName";
+            lblReportName.Size = new Size(92, 14);
+            lblReportName.TabIndex = 5;
+            lblReportName.Text = "Report Name";
+            lblReportName.TextAlign = ContentAlignment.BottomLeft;
+            // 
+            // textBox1
+            // 
+            textBox1.BorderStyle = BorderStyle.None;
+            textBox1.Font = new Font("Cormorant Garamond SemiBold", 10F, FontStyle.Italic);
+            textBox1.ForeColor = SystemColors.ControlDark;
+            textBox1.Location = new Point(13, 57);
+            textBox1.Multiline = true;
+            textBox1.Name = "textBox1";
+            textBox1.ReadOnly = true;
+            textBox1.Size = new Size(829, 45);
+            textBox1.TabIndex = 7;
+            textBox1.Text = "The FastFetch reports can capture up to 10,000 records, and are ideal for large datasets under 10,000 records. For small datasets or datasets over 10,000 records, use the Reports features instead.";
+            // 
+            // splitContainer1
+            // 
+            splitContainer1.Dock = DockStyle.Fill;
+            splitContainer1.Location = new Point(3, 153);
+            splitContainer1.Name = "splitContainer1";
+            // 
+            // splitContainer1.Panel1
+            // 
+            splitContainer1.Panel1.Controls.Add(treeViewReports);
+            // 
+            // splitContainer1.Panel2
+            // 
+            splitContainer1.Panel2.Controls.Add(panelContent);
+            splitContainer1.Size = new Size(1178, 359);
+            splitContainer1.SplitterDistance = 390;
+            splitContainer1.TabIndex = 8;
+            // 
+            // treeViewReports
+            // 
+            treeViewReports.Dock = DockStyle.Fill;
+            treeViewReports.Location = new Point(0, 0);
+            treeViewReports.Name = "treeViewReports";
+            treeNode1.Name = "Unworked Matters";
+            treeNode1.Tag = "ReportsOpenMattersUnworkedMatters";
+            treeNode1.Text = "Unworked Matters";
+            treeNode2.Name = "Open Matters";
+            treeNode2.Tag = "ReportsOpenMatters";
+            treeNode2.Text = "Open Matters";
+            treeNode3.Name = "All Matters";
+            treeNode3.Tag = "ReportsAllMatters";
+            treeNode3.Text = "All Matters";
+            treeNode4.Name = "Reports";
+            treeNode4.Tag = "Reports";
+            treeNode4.Text = "Reports";
+            treeNode5.Name = "CreatedSince";
+            treeNode5.Tag = "FastFetchCreatedSince";
+            treeNode5.Text = "All Created Since";
+            treeNode6.Name = "FastFetch";
+            treeNode6.NodeFont = new Font("Microsoft Sans Serif", 8.25F, FontStyle.Regular, GraphicsUnit.Point, 0);
+            treeNode6.Tag = "FastFetch";
+            treeNode6.Text = "FastFetch";
+            treeViewReports.Nodes.AddRange(new TreeNode[] { treeNode4, treeNode6 });
+            treeViewReports.Size = new Size(390, 359);
+            treeViewReports.TabIndex = 0;
+            treeViewReports.AfterSelect += treeViewReports_AfterSelect;
+            // 
+            // panelContent
+            // 
+            panelContent.AutoScroll = true;
+            panelContent.Dock = DockStyle.Fill;
+            panelContent.Location = new Point(0, 0);
+            panelContent.Name = "panelContent";
+            panelContent.Size = new Size(784, 359);
+            panelContent.TabIndex = 0;
+            // 
+            // panel1
+            // 
+            panel1.Controls.Add(lblVersion);
+            panel1.Controls.Add(progressBarPagesRetrieved);
+            panel1.Controls.Add(lblReportPageRetrieved);
+            panel1.Controls.Add(textBox1);
+            panel1.Controls.Add(lblReportName);
+            panel1.Dock = DockStyle.Fill;
+            panel1.Location = new Point(3, 3);
+            panel1.Name = "panel1";
+            panel1.Size = new Size(1178, 144);
+            panel1.TabIndex = 9;
+            // 
+            // lblVersion
+            // 
+            lblVersion.AutoSize = true;
+            lblVersion.Font = new Font("Cinzel", 8.25F, FontStyle.Italic, GraphicsUnit.Point, 0);
+            lblVersion.ForeColor = SystemColors.AppWorkspace;
+            lblVersion.Location = new Point(377, 10);
+            lblVersion.Name = "lblVersion";
+            lblVersion.Size = new Size(83, 13);
+            lblVersion.TabIndex = 8;
+            lblVersion.Text = "Version 0.0.0";
+            // 
+            // tableLayoutPanel1
+            // 
+            tableLayoutPanel1.ColumnCount = 1;
+            tableLayoutPanel1.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            tableLayoutPanel1.Controls.Add(panel1, 0, 0);
+            tableLayoutPanel1.Controls.Add(splitContainer1, 0, 1);
+            tableLayoutPanel1.Dock = DockStyle.Fill;
+            tableLayoutPanel1.Location = new Point(0, 24);
+            tableLayoutPanel1.Name = "tableLayoutPanel1";
+            tableLayoutPanel1.RowCount = 2;
+            tableLayoutPanel1.RowStyles.Add(new RowStyle(SizeType.Absolute, 150F));
+            tableLayoutPanel1.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            tableLayoutPanel1.Size = new Size(1184, 515);
+            tableLayoutPanel1.TabIndex = 8;
+            // 
+            // MainForm
+            // 
+            AutoScaleDimensions = new SizeF(7F, 15F);
+            AutoScaleMode = AutoScaleMode.Font;
+            ClientSize = new Size(1184, 561);
+            Controls.Add(tableLayoutPanel1);
+            Controls.Add(statusStrip1);
+            Controls.Add(menuStrip1);
+            MainMenuStrip = menuStrip1;
+            Name = "MainForm";
+            Text = "CalliAPI";
+            menuStrip1.ResumeLayout(false);
+            menuStrip1.PerformLayout();
+            statusStrip1.ResumeLayout(false);
+            statusStrip1.PerformLayout();
+            splitContainer1.Panel1.ResumeLayout(false);
+            splitContainer1.Panel2.ResumeLayout(false);
+            ((System.ComponentModel.ISupportInitialize)splitContainer1).EndInit();
+            splitContainer1.ResumeLayout(false);
+            panel1.ResumeLayout(false);
+            panel1.PerformLayout();
+            tableLayoutPanel1.ResumeLayout(false);
+            ResumeLayout(false);
+            PerformLayout();
+        }
+
+        #endregion
+        private MenuStrip menuStrip1;
+        private ToolStripMenuItem fileToolStripMenuItem;
+        private ToolStripMenuItem exitToolStripMenuItem;
+        private ToolStripMenuItem reportsToolStripMenuItem;
+        private ToolStripMenuItem programToolStripMenuItem;
+        private ToolStripMenuItem mailerProgramToolStripMenuItem;
+        private ToolStripMenuItem openToolStripMenuItem;
+        private StatusStrip statusStrip1;
+        private ToolStripStatusLabel lblApiStatus;
+        private ToolStripStatusLabel lblClioAPIStatus;
+        private ToolStripMenuItem allMattersToolStripMenuItem;
+        private Label lblReportPageRetrieved;
+        private Label lblReportName;
+        private ToolStripMenuItem all713MattersToolStripMenuItem;
+        private TextBox textBox1;
+        private ToolStripMenuItem allUnworked7And13MattersToolStripMenuItem;
+        private SplitContainer splitContainer1;
+        private TreeView treeViewReports;
+        private Panel panelContent;
+        private Panel panel1;
+        private ToolStripStatusLabel toolStripBtnConnectToClio;
+        private TableLayoutPanel tableLayoutPanel1;
+        private Label lblVersion;
+        private ToolStripMenuItem checkForUpdatesToolStripMenuItem;
+        private ProgressBarWithText progressBarPagesRetrieved;
+        private ToolStripMenuItem debugToolStripMenuItem;
+        private ToolStripMenuItem toolStripMenuItem2;
+        private ToolStripMenuItem resetRegistryKeyToolStripMenuItem;
+        private ToolStripMenuItem customReportBuilderToolStripMenuItem;
+        private ToolStripMenuItem manifestResourceListToolStripMenuItem;
+    }
+}
+
+// File: UI\ReportForm.cs
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using CalliAPI.Models;
+
+namespace CalliAPI.UI
+{
+    public partial class ReportForm : Form
+    {
+        public ReportForm()
+        {
+            InitializeComponent();
+        }
+
+        public void SetData(DataTable dataTable)
+        {
+            // Check if the DataTable is null or empty
+            if (dataTable == null || dataTable.Columns.Count == 0)
+            {
+                MessageBox.Show("No data available to display.", "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+
+            dataGridView1.DataSource = dataTable;
+            dataGridView1.AutoGenerateColumns = true;
+            dataGridView1.ColumnHeadersVisible = true; // Ensure headers are visible
+
+            // Breakpoint
+            Thread.Sleep(10);
+        }
+
+        private void saveToExcel_Click(object sender, EventArgs e)
+        {
+
+            using (var sfd = new SaveFileDialog())
+            {
+                sfd.Filter = "Excel Files (*.xlsx)|*.xlsx";
+                sfd.Title = "Save Report As Excel File";
+                sfd.FileName = "MattersReport.xlsx";
+
+                if (sfd.ShowDialog() == DialogResult.OK)
+                {
+                    ExportDataGridViewToExcel(dataGridView1, sfd.FileName);
+                    MessageBox.Show("Export complete!", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+
+        }
+
+
+        private void ExportDataGridViewToExcel(DataGridView dgv, string filePath)
+        {
+            using var workbook = new ClosedXML.Excel.XLWorkbook();
+            var worksheet = workbook.Worksheets.Add("Matters");
+
+            // Add headers
+            for (int col = 0; col < dgv.Columns.Count; col++)
+            {
+                worksheet.Cell(1, col + 1).Value = dgv.Columns[col].HeaderText;
+            }
+
+            // Add rows
+            for (int row = 0; row < dgv.Rows.Count; row++)
+            {
+                for (int col = 0; col < dgv.Columns.Count; col++)
+                {
+                    worksheet.Cell(row + 2, col + 1).Value = dgv.Rows[row].Cells[col].Value?.ToString();
+                }
+            }
+
+            workbook.SaveAs(filePath);
+        }
+
+        private void txtFilter_TextChanged(object sender, EventArgs e)
+        {
+            var table = dataGridView1.DataSource as DataTable;
+            if (table == null) return;
+
+            string filterText = txtFilter.Text.Replace("'", "''"); // Escape single quotes
+
+            var filterConditions = table.Columns
+         .Cast<DataColumn>()
+         .Select(col => $"CONVERT([{col.ColumnName}], System.String) LIKE '%{filterText}%'");
+
+            table.DefaultView.RowFilter = string.Join(" OR ", filterConditions);
+
+        }
+
+    }
+}
+
+
+// File: UI\ReportForm.Designer.cs
+namespace CalliAPI.UI
+{
+    partial class ReportForm
+    {
+        /// <summary>
+        /// Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary>
+        /// Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Windows Form Designer generated code
+
+        /// <summary>
+        /// Required method for Designer support - do not modify
+        /// the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            dataGridView1 = new DataGridView();
+            toolStrip1 = new ToolStrip();
+            saveToExcel = new ToolStripLabel();
+            toolStripSeparator1 = new ToolStripSeparator();
+            toolStripLabel1 = new ToolStripLabel();
+            txtFilter = new ToolStripTextBox();
+            tableLayoutPanel1 = new TableLayoutPanel();
+            ((System.ComponentModel.ISupportInitialize)dataGridView1).BeginInit();
+            toolStrip1.SuspendLayout();
+            tableLayoutPanel1.SuspendLayout();
+            SuspendLayout();
+            // 
+            // dataGridView1
+            // 
+            dataGridView1.AllowUserToAddRows = false;
+            dataGridView1.AllowUserToDeleteRows = false;
+            dataGridView1.AllowUserToOrderColumns = true;
+            dataGridView1.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize;
+            dataGridView1.Dock = DockStyle.Fill;
+            dataGridView1.Location = new Point(3, 28);
+            dataGridView1.Name = "dataGridView1";
+            dataGridView1.ReadOnly = true;
+            dataGridView1.Size = new Size(915, 530);
+            dataGridView1.TabIndex = 0;
+            // 
+            // toolStrip1
+            // 
+            toolStrip1.Items.AddRange(new ToolStripItem[] { saveToExcel, toolStripSeparator1, toolStripLabel1, txtFilter });
+            toolStrip1.Location = new Point(0, 0);
+            toolStrip1.Name = "toolStrip1";
+            toolStrip1.Size = new Size(921, 25);
+            toolStrip1.TabIndex = 1;
+            toolStrip1.Text = "toolStrip1";
+            // 
+            // saveToExcel
+            // 
+            saveToExcel.Name = "saveToExcel";
+            saveToExcel.Size = new Size(76, 22);
+            saveToExcel.Text = "Save To Excel";
+            saveToExcel.Click += saveToExcel_Click;
+            // 
+            // toolStripSeparator1
+            // 
+            toolStripSeparator1.Name = "toolStripSeparator1";
+            toolStripSeparator1.Size = new Size(6, 25);
+            // 
+            // toolStripLabel1
+            // 
+            toolStripLabel1.Name = "toolStripLabel1";
+            toolStripLabel1.Size = new Size(36, 22);
+            toolStripLabel1.Text = "Filter:";
+            // 
+            // txtFilter
+            // 
+            txtFilter.Name = "txtFilter";
+            txtFilter.Size = new Size(100, 25);
+            txtFilter.TextChanged += txtFilter_TextChanged;
+            // 
+            // tableLayoutPanel1
+            // 
+            tableLayoutPanel1.ColumnCount = 1;
+            tableLayoutPanel1.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            tableLayoutPanel1.Controls.Add(toolStrip1, 0, 0);
+            tableLayoutPanel1.Controls.Add(dataGridView1, 0, 1);
+            tableLayoutPanel1.Dock = DockStyle.Fill;
+            tableLayoutPanel1.Location = new Point(0, 0);
+            tableLayoutPanel1.Name = "tableLayoutPanel1";
+            tableLayoutPanel1.RowCount = 2;
+            tableLayoutPanel1.RowStyles.Add(new RowStyle());
+            tableLayoutPanel1.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            tableLayoutPanel1.Size = new Size(921, 561);
+            tableLayoutPanel1.TabIndex = 2;
+            // 
+            // ReportForm
+            // 
+            AutoScaleDimensions = new SizeF(7F, 15F);
+            AutoScaleMode = AutoScaleMode.Font;
+            ClientSize = new Size(921, 561);
+            Controls.Add(tableLayoutPanel1);
+            Name = "ReportForm";
+            Text = "Report Form";
+            ((System.ComponentModel.ISupportInitialize)dataGridView1).EndInit();
+            toolStrip1.ResumeLayout(false);
+            toolStrip1.PerformLayout();
+            tableLayoutPanel1.ResumeLayout(false);
+            tableLayoutPanel1.PerformLayout();
+            ResumeLayout(false);
+        }
+
+        #endregion
+
+        private DataGridView dataGridView1;
+        private ToolStrip toolStrip1;
+        private ToolStripLabel saveToExcel;
+        private ToolStripSeparator toolStripSeparator1;
+        private ToolStripLabel toolStripLabel1;
+        private ToolStripTextBox txtFilter;
+        private TableLayoutPanel tableLayoutPanel1;
+    }
+}
+
+// File: UI\SecretGatekeeper.cs
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace CalliAPI.UI
+{
+    public partial class SecretGatekeeper : Form
+    {
+        public string ClientSecret => txtSecret.Text;
+        public SecretGatekeeper()
+        {
+            InitializeComponent();
+        }
+
+    }
+}
+
+
+// File: UI\SecretGatekeeper.Designer.cs
+namespace CalliAPI.UI
+{
+    partial class SecretGatekeeper
+    {
+        /// <summary>
+        /// Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary>
+        /// Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Windows Form Designer generated code
+
+        /// <summary>
+        /// Required method for Designer support - do not modify
+        /// the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            label1 = new Label();
+            label2 = new Label();
+            txtSecret = new TextBox();
+            label3 = new Label();
+            label4 = new Label();
+            label5 = new Label();
+            button1 = new Button();
+            button2 = new Button();
+            SuspendLayout();
+            // 
+            // label1
+            // 
+            label1.AutoSize = true;
+            label1.Location = new Point(12, 19);
+            label1.Name = "label1";
+            label1.Size = new Size(203, 15);
+            label1.TabIndex = 0;
+            label1.Text = "Enter your CLIO_CLIENT_SECRET key:";
+            // 
+            // label2
+            // 
+            label2.AutoSize = true;
+            label2.Font = new Font("Segoe UI", 9F, FontStyle.Italic);
+            label2.Location = new Point(12, 56);
+            label2.Name = "label2";
+            label2.Size = new Size(410, 15);
+            label2.TabIndex = 1;
+            label2.Text = "If you don't know what that means, ask your software support! Do not guess!";
+            // 
+            // txtSecret
+            // 
+            txtSecret.Location = new Point(221, 16);
+            txtSecret.Name = "txtSecret";
+            txtSecret.Size = new Size(422, 23);
+            txtSecret.TabIndex = 2;
+            // 
+            // label3
+            // 
+            label3.AutoSize = true;
+            label3.Font = new Font("Segoe UI", 32F);
+            label3.Location = new Point(12, 94);
+            label3.Name = "label3";
+            label3.Size = new Size(367, 59);
+            label3.TabIndex = 3;
+            label3.Text = "What's Going On?";
+            // 
+            // label4
+            // 
+            label4.AutoSize = true;
+            label4.Location = new Point(12, 169);
+            label4.Name = "label4";
+            label4.Size = new Size(767, 15);
+            label4.TabIndex = 4;
+            label4.Text = "You're seeing this because you don't have the proper client secret for the CalliAPI Clio App assigned to your registry. If you know it, enter it now. ";
+            // 
+            // label5
+            // 
+            label5.AutoSize = true;
+            label5.Location = new Point(12, 194);
+            label5.Name = "label5";
+            label5.Size = new Size(234, 15);
+            label5.TabIndex = 5;
+            label5.Text = "Otherwise, reach out to your support team.";
+            // 
+            // button1
+            // 
+            button1.DialogResult = DialogResult.OK;
+            button1.Location = new Point(649, 16);
+            button1.Name = "button1";
+            button1.Size = new Size(75, 26);
+            button1.TabIndex = 6;
+            button1.Text = "Submit";
+            button1.UseVisualStyleBackColor = true;
+            // 
+            // button2
+            // 
+            button2.DialogResult = DialogResult.Cancel;
+            button2.Location = new Point(435, 415);
+            button2.Name = "button2";
+            button2.Size = new Size(344, 23);
+            button2.TabIndex = 7;
+            button2.Text = "I don't have a CLIO_CLIENT_SECRET key; exit the program.";
+            button2.UseVisualStyleBackColor = true;
+            // 
+            // SecretGatekeeper
+            // 
+            AutoScaleDimensions = new SizeF(7F, 15F);
+            AutoScaleMode = AutoScaleMode.Font;
+            ClientSize = new Size(800, 450);
+            Controls.Add(button2);
+            Controls.Add(button1);
+            Controls.Add(label5);
+            Controls.Add(label4);
+            Controls.Add(label3);
+            Controls.Add(txtSecret);
+            Controls.Add(label2);
+            Controls.Add(label1);
+            Name = "SecretGatekeeper";
+            Text = "SecretGatekeeper";
+            ResumeLayout(false);
+            PerformLayout();
+        }
+
+        #endregion
+
+        private Label label1;
+        private Label label2;
+        private TextBox txtSecret;
+        private Label label3;
+        private Label label4;
+        private Label label5;
+        private Button button1;
+        private Button button2;
+    }
+}
+
+// File: Utilities\FontHelper.cs
+using System;
+using System.Drawing;
+using System.Drawing.Text;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+
+namespace CalliAPI.Utilities
+{
+    public static class EmbeddedFontLoader
+    {
+        private static readonly PrivateFontCollection fontCollection = new();
+
+        /// <summary>
+        /// Loads a font from an embedded resource and returns a Font object.
+        /// </summary>
+        /// <param name="resourceName">The full resource name, e.g., "CalliAPI.Resources.CormorantGaramond-Regular.ttf"</param>
+        /// <param name="size">Font size</param>
+        /// <param name="style">Font style</param>
+        /// <returns>A Font object ready to use</returns>
+        public static Font LoadFont(string resourceName, float size, FontStyle style = FontStyle.Regular)
+        {
+            using Stream fontStream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName)
+                ?? throw new FileNotFoundException($"Font resource '{resourceName}' not found.");
+
+            byte[] fontData = new byte[fontStream.Length];
+            fontStream.Read(fontData, 0, fontData.Length);
+
+            IntPtr fontPtr = Marshal.AllocCoTaskMem(fontData.Length);
+            Marshal.Copy(fontData, 0, fontPtr, fontData.Length);
+            fontCollection.AddMemoryFont(fontPtr, fontData.Length);
+            Marshal.FreeCoTaskMem(fontPtr);
+
+            return new Font(fontCollection.Families[0], size, style);
+        }
+    }
+}
+
+
+// File: Utilities\KeywordTooltipManager.cs
+
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Linq;
+using System.Windows.Forms;
+using System.Text.RegularExpressions;
+
+namespace CalliAPI.Utilities
+{
+    /// <summary>
+    /// Manages keyword highlighting and tooltip display in a RichTextBox.
+    /// </summary>
+    public class KeywordTooltipManager
+    {
+        private readonly RichTextBox _richTextBox;
+        private readonly ToolTip _toolTip;
+        private readonly Dictionary<string, string> _keywords;
+        private readonly Dictionary<(int start, int length), string> _keywordRanges = new();
+
+        public KeywordTooltipManager(RichTextBox richTextBox, ToolTip toolTip, Dictionary<string, string> keywords)
+        {
+            _richTextBox = richTextBox;
+            _toolTip = toolTip;
+            _keywords = keywords;
+
+            _richTextBox.MouseMove += RichTextBox_MouseMove;
+        }
+
+        /// <summary>
+        /// Call this after setting the RichTextBox text to highlight keywords.
+        /// </summary>
+        public void HighlightKeywords()
+        {
+            _keywordRanges.Clear();
+
+            foreach (var kvp in _keywords)
+            {
+                string keyword = kvp.Key;
+                string pattern = $@"\b{Regex.Escape(keyword)}\b";
+                foreach (Match match in Regex.Matches(_richTextBox.Text, pattern, RegexOptions.IgnoreCase))
+                {
+                    _richTextBox.Select(match.Index, match.Length);
+                    _richTextBox.SelectionColor = Color.Blue;
+                    _richTextBox.SelectionFont = new Font(_richTextBox.Font, FontStyle.Underline);
+                    _keywordRanges[(match.Index, match.Length)] = kvp.Value;
+                }
+            }
+
+            _richTextBox.Select(0, 0); // Reset selection
+        }
+
+        private void RichTextBox_MouseMove(object sender, MouseEventArgs e)
+        {
+            int charIndex = _richTextBox.GetCharIndexFromPosition(e.Location);
+
+            foreach (var range in _keywordRanges)
+            {
+                int start = range.Key.start;
+                int length = range.Key.length;
+
+                if (charIndex >= start && charIndex < start + length)
+                {
+                    _toolTip.SetToolTip(_richTextBox, range.Value);
+                    return;
+                }
+            }
+
+            _toolTip.SetToolTip(_richTextBox, string.Empty); // Clear tooltip if not on keyword
+        }
+    }
+}
+
+
+// File: Utilities\QueryExecutor.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using CalliAPI.BusinessLogic;
+using CalliAPI.Interfaces;
+using CalliAPI.Models;
+
+namespace CalliAPI.Utilities
+{
+
+    public static class QueryExecutor
+    {
+        public static async System.Threading.Tasks.Task ExecuteAsync<T>(
+        IQueryBuilder<T> builder,
+        ClioService clioService)
+        {
+            string fields = builder.SelectedFields;
+            var filters = builder.SelectedFilters;
+
+            IAsyncEnumerable<T> results = GetResults<T>(clioService, fields);
+
+            foreach (var filter in filters)
+            {
+                results = filter(results);
+            }
+
+            await ReportLauncher_ShowAsync(results);
+        }
+
+        private static IAsyncEnumerable<T> GetResults<T>(ClioService clioService, string fields)
+        {
+            if (typeof(T) == typeof(Matter))
+            {
+                return (IAsyncEnumerable<T>)clioService.GetAllMattersAsync(fields);
+            }
+            else if (typeof(T) == typeof(CalliAPI.Models.Task))
+            {
+                //return (IAsyncEnumerable<T>)clioService.GetAllTasksAsync(fields); // hypothetical
+            }
+
+            throw new NotSupportedException($"Querying for type {typeof(T).Name} is not supported.");
+        }
+
+        private static async System.Threading.Tasks.Task ReportLauncher_ShowAsync<T>(IAsyncEnumerable<T> results)
+        {
+            if (results == null)
+            {
+                throw new ArgumentNullException(nameof(results), "Results cannot be null.");
+            }
+
+            if (results is IAsyncEnumerable<Matter> matters)
+            {
+                await ReportLauncher.ShowAsync((IAsyncEnumerable<Matter>)results);
+            }
+            
+        }
+    }
+
+}
+
+
+// File: Utilities\ReportLauncher.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using AmourgisCOREServices;
+using CalliAPI.Models;
+using CalliAPI.UI;
+using Task = System.Threading.Tasks.Task;
+
+namespace CalliAPI.Utilities
+{
+
+
+    public static class ReportLauncher
+    {
+        private static readonly AMO_Logger _logger = new AMO_Logger("CalliAPI");
+
+        /// <summary>
+        /// This method is called from the ClioService to show a report. It takes an IAsyncEnumerable<Matter> and converts it to a DataTable, then displays it
+        /// in a ReportForm.
+        /// </summary>
+        /// <param name="matters"></param>
+        /// <returns></returns>
+        public static async Task ShowAsync(IAsyncEnumerable<Matter> matters)
+        {
+            if (matters == null)
+            {
+                _logger.LogError("matters is null");
+                return;
+            }
+
+            _logger.Info("ReportLauncher.ShowAsync called");
+            // This method is called from the ClioService to show a report
+            // It takes an IAsyncEnumerable<Matter> and converts it to a DataTable
+            var table = await matters.ToSmartDataTableAsync(); // Defined in MatterFilters.cs, this consumes the stream
+            var form = new ReportForm();
+            form.SetData(table);
+            form.Show();
+        }
+
+    }
+
+
+}
+
+
+// File: Utilities\TooltipDefinitions.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using CalliAPI.BusinessLogic;
+
+namespace CalliAPI.Utilities
+{
+
+    /// <summary>
+    /// Centralized definitions for tooltips used across the application.
+    /// </summary>
+    internal class TooltipDefinitions
+    {
+
+
+        public static readonly Dictionary<string, string> Keywords = new()
+        {
+        { "open", "Open means the matter has a status of 'Open' in Clio." },
+        { "unworked", "Unworked means the matter has no open tasks and is in an early-stage workflow." },
+        { "prefile", ClioService.GetPrefileStageDescription() },
+        { "fastfetch", "FastFetch retrieves up to 10,000 matters in parallel since a given date." },
+        { "713", "Refers to practice areas ending in 7 or 13, typically Chapter 7 or 13 bankruptcy." },
+        { "practice area" , "The practice area is the category of law under which the matter falls." },
+        { "matter", "A matter is a case or project that a law firm is working on." },
+        { "task", "A task is an action item or assignment related to a matter." },
+        { "status", "The status field in Clio indicates the current state of a matter or task." },
+        { "complete", "Complete means the task has been finished." },
+        { "filter", "Filter allows you to narrow down the list of matters based on criteria." }
+        };
+
+
+    }
+}
+
+
+// File: Utilities\VersionHelper.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Threading.Tasks;
+using Velopack;
+using Velopack.Sources;
+
+namespace CalliAPI.Utilities
+{
+
+    /// <summary>
+    /// Provides access to the application's version information as defined in the .csproj file.
+    /// </summary>
+    public static class VersionHelper
+    {
+    
+        /// <summary>
+        /// Gets the full version from the executing assembly (e.g., 1.2.3.0).
+        /// </summary>
+        public static Version GetVersion()
+        {
+            return Assembly.GetExecutingAssembly().GetName().Version;
+        }
+
+        /// <summary>
+        /// Gets the version as a formatted string (e.g., "v1.2.3").
+        /// </summary>
+        public static string GetFormattedVersion(bool includeBuild = false)
+        {
+            var version = GetVersion();
+            return includeBuild
+            ? $"v{version.Major}.{version.Minor}.{version.Build}"
+            : $"v{version.Major}.{version.Minor}";
+        }
+
+        /// <summary>
+        /// Gets the version as a string suitable for display in UI.
+        /// </summary>
+        public static string GetDisplayVersion()
+        {
+            return $"CalliAPI {GetFormattedVersion(includeBuild: true)}";
+        }
+
+        /// <summary>
+        /// Checks for updates and applies them if available.
+        /// </summary>
+        /// <returns></returns>
+        public static async Task UpdateCalliAPI()
+        {
+#if !DEBUG
+            var mgr = new UpdateManager(
+                new GithubSource("https://github.com/Amourgis-Associates-Attorneys-at-Law/CalliAPICORE", accessToken: null, prerelease: false));
+
+            // check for new version
+            var newVersion = await mgr.CheckForUpdatesAsync();
+            if (newVersion == null)
+                return; // no update available
+
+            // download new version
+            await mgr.DownloadUpdatesAsync(newVersion);
+
+            // install new version and restart app
+            mgr.ApplyUpdatesAndRestart(newVersion);
+#endif
+        }
+    }
+
+}
+
+
+// File: UI\Controls\MatterQueryControl.cs
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using CalliAPI.BusinessLogic;
+using CalliAPI.Interfaces;
+using CalliAPI.Models;
+using DocumentFormat.OpenXml.Office2016.Drawing.ChartDrawing;
+
+namespace CalliAPI.UI.Controls
+{
+    public partial class MatterQueryControl : UserControl, IQueryBuilder<Matter>
+    {
+        private readonly ClioService _clioService;
+
+        private string matterFieldsSelected;
+        private string clientFieldsSelected;
+        private string fields;
+        private string status;
+        private string addedHtml = string.Empty;
+
+
+        public MatterQueryControl(ClioService clioService)
+        {
+            _clioService = clioService ?? throw new ArgumentNullException(nameof(clioService));
+            InitializeComponent();
+
+            if (!clioService.IsAuthenticated)
+            {
+                btnSearch.Enabled = false;
+                MessageBox.Show("Clio is not authenticated. Close the Report Builder and return to the main form in order to Connect to Clio.", "Clio not authenticated", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        string IQueryBuilder<Matter>.SelectedFields => throw new NotImplementedException();
+
+        List<Func<IAsyncEnumerable<Matter>, IAsyncEnumerable<Matter>>> IQueryBuilder<Matter>.SelectedFilters => throw new NotImplementedException();
+
+
+        private void Update_Preview(object sender, EventArgs e)
+        {
+
+            // Build the report
+            matterFieldsSelected = "id";
+            clientFieldsSelected = String.Empty;
+            fields = String.Empty;
+            status = String.Empty;
+            addedHtml = string.Empty;
+
+            // Get selected fields from the checked list boxes
+            matterFieldsSelected += clbMatterFields.CheckedItems.Count > 0 ?
+                clbMatterFields.CheckedItems.Cast<string>().Aggregate((current, next) => current + "," + next) :
+                "";
+
+            clientFieldsSelected = clbClientFields.CheckedItems.Count > 0 ?
+                clbClientFields.CheckedItems.Cast<string>().Aggregate((current, next) => current + "," + next) :
+                "";
+
+            status = string.Join(",", clbStatus.CheckedItems.Cast<string>());
+
+            // Construct the fields string based on selections (if we don't have any client fields, we don't need to ask for client info)
+
+            fields = matterFieldsSelected;
+
+            if (!string.IsNullOrEmpty(clientFieldsSelected))
+            {
+                fields += $",client{{{clientFieldsSelected}}}";
+            }
+
+            //fields = string.IsNullOrEmpty(clientFieldsSelected) ?
+            //    matterFieldsSelected :
+            //    matterFieldsSelected + ",client{" + clientFieldsSelected + "}";
+
+            //fields = $"{matterFieldsSelected}" +
+            //    $"{(string.IsNullOrEmpty(clientFieldsSelected) ? "" : 
+            //    ",client{" + clientFieldsSelected + "}")}";
+
+            status = string.Join(",", clbStatus.CheckedItems.Cast<string>());
+
+            if (chkCreatedSince.Checked)
+            {
+                string escapedDate;
+                escapedDate = Uri.EscapeDataString(monthCalendar1.SelectionStart.ToUniversalTime().ToString("o"));
+                addedHtml += $"&created_since={escapedDate}";
+            }
+
+            if (chkAddedHtml.Checked)
+            {
+                addedHtml += Uri.EscapeDataString(txtAddedHtml.Text);
+            }
+
+
+
+
+            // Update the preview label with the selected fields and filters
+            lblFields.Text = fields;
+            lblStatus.Text = status;
+            lblAddedHtml.Text = addedHtml;
+        }
+
+        private async void btnSearch_Click(object sender, EventArgs e)
+        {
+            Update_Preview(sender, e);
+
+
+
+            Form? parentForm = this.FindForm();
+            if (parentForm != null)
+            {
+                parentForm.WindowState = FormWindowState.Minimized;
+            }
+
+
+
+            // Launch the report with the selected fields and filters
+            await _clioService.GetAllMattersAsync(fields, status, addedHtml);
+
+        }
+
+        private void linkLabel1_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
+        {
+            System.Diagnostics.Process.Start("https://docs.developers.clio.com/api-reference/#tag/Matters/operation/Matter#index");
+        }
+
+        private void clbFields_ItemCheck(object sender, ItemCheckEventArgs e)
+        {
+            // Delay the update until after the check state has changed
+            this.BeginInvoke((MethodInvoker)(() => Update_Preview(sender, e)));
+        }
+
+
+
+    }
+}
+
+
+// File: UI\Controls\MatterQueryControl.Designer.cs
+namespace CalliAPI.UI.Controls
+{
+    partial class MatterQueryControl : UserControl
+    {
+        /// <summary> 
+        /// Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary> 
+        /// Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Component Designer generated code
+
+        /// <summary> 
+        /// Required method for Designer support - do not modify 
+        /// the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            clbMatterFields = new CheckedListBox();
+            label1 = new Label();
+            label2 = new Label();
+            clbClientFields = new CheckedListBox();
+            groupBox1 = new GroupBox();
+            label3 = new Label();
+            groupBox2 = new GroupBox();
+            chkAddedHtml = new CheckBox();
+            linkLabel1 = new LinkLabel();
+            txtAddedHtml = new TextBox();
+            chkCreatedSince = new CheckBox();
+            monthCalendar1 = new MonthCalendar();
+            clbStatus = new CheckedListBox();
+            btnSearch = new Button();
+            label4 = new Label();
+            groupBox3 = new GroupBox();
+            lblAddedHtml = new Label();
+            lblStatus = new Label();
+            lblFields = new Label();
+            label6 = new Label();
+            label5 = new Label();
+            groupBox1.SuspendLayout();
+            groupBox2.SuspendLayout();
+            groupBox3.SuspendLayout();
+            SuspendLayout();
+            // 
+            // clbMatterFields
+            // 
+            clbMatterFields.CheckOnClick = true;
+            clbMatterFields.FormattingEnabled = true;
+            clbMatterFields.Items.AddRange(new object[] { "display_number", "description", "status", "location", "client_reference", "client_id", "maildrop_address", "open_date", "close_date", "pending_date", "created_at", "updated_at", "has_tasks", "last_activity_date", "matter_stage_updated_at" });
+            clbMatterFields.Location = new Point(16, 49);
+            clbMatterFields.Name = "clbMatterFields";
+            clbMatterFields.Size = new Size(175, 292);
+            clbMatterFields.TabIndex = 0;
+            clbMatterFields.ItemCheck += clbFields_ItemCheck;
+            // 
+            // label1
+            // 
+            label1.AutoSize = true;
+            label1.Location = new Point(16, 31);
+            label1.Name = "label1";
+            label1.Size = new Size(76, 15);
+            label1.TabIndex = 1;
+            label1.Text = "Matter fields:";
+            // 
+            // label2
+            // 
+            label2.AutoSize = true;
+            label2.Location = new Point(211, 31);
+            label2.Name = "label2";
+            label2.Size = new Size(72, 15);
+            label2.TabIndex = 3;
+            label2.Text = "Client fields:";
+            // 
+            // clbClientFields
+            // 
+            clbClientFields.CheckOnClick = true;
+            clbClientFields.FormattingEnabled = true;
+            clbClientFields.Items.AddRange(new object[] { "name", "first_name", "middle_name", "last_name", "date_of_birth", "created_at", "updated_at", "prefix", "title", "initials", "clio_connect_email", "primary_email_address", "secondary_email_address", "primary_phone_number", "secondary_phone_number", "is_client", "is_clio_for_client_user" });
+            clbClientFields.Location = new Point(211, 49);
+            clbClientFields.Name = "clbClientFields";
+            clbClientFields.Size = new Size(175, 310);
+            clbClientFields.TabIndex = 2;
+            clbClientFields.ItemCheck += clbFields_ItemCheck;
+            clbClientFields.SelectedIndexChanged += Update_Preview;
+            // 
+            // groupBox1
+            // 
+            groupBox1.Controls.Add(label1);
+            groupBox1.Controls.Add(label2);
+            groupBox1.Controls.Add(clbMatterFields);
+            groupBox1.Controls.Add(clbClientFields);
+            groupBox1.Location = new Point(3, 3);
+            groupBox1.Name = "groupBox1";
+            groupBox1.Size = new Size(457, 430);
+            groupBox1.TabIndex = 4;
+            groupBox1.TabStop = false;
+            groupBox1.Text = "Fields to return:";
+            // 
+            // label3
+            // 
+            label3.AutoSize = true;
+            label3.Location = new Point(15, 49);
+            label3.Name = "label3";
+            label3.Size = new Size(42, 15);
+            label3.TabIndex = 5;
+            label3.Text = "Status:";
+            // 
+            // groupBox2
+            // 
+            groupBox2.Controls.Add(chkAddedHtml);
+            groupBox2.Controls.Add(linkLabel1);
+            groupBox2.Controls.Add(txtAddedHtml);
+            groupBox2.Controls.Add(chkCreatedSince);
+            groupBox2.Controls.Add(monthCalendar1);
+            groupBox2.Controls.Add(clbStatus);
+            groupBox2.Controls.Add(label3);
+            groupBox2.Location = new Point(466, 3);
+            groupBox2.Name = "groupBox2";
+            groupBox2.Size = new Size(506, 430);
+            groupBox2.TabIndex = 6;
+            groupBox2.TabStop = false;
+            groupBox2.Text = "Filters to apply:";
+            // 
+            // chkAddedHtml
+            // 
+            chkAddedHtml.AutoSize = true;
+            chkAddedHtml.Location = new Point(37, 328);
+            chkAddedHtml.Name = "chkAddedHtml";
+            chkAddedHtml.Size = new Size(15, 14);
+            chkAddedHtml.TabIndex = 12;
+            chkAddedHtml.UseVisualStyleBackColor = true;
+            chkAddedHtml.CheckedChanged += Update_Preview;
+            // 
+            // linkLabel1
+            // 
+            linkLabel1.AutoSize = true;
+            linkLabel1.Location = new Point(58, 327);
+            linkLabel1.Name = "linkLabel1";
+            linkLabel1.Size = new Size(254, 15);
+            linkLabel1.TabIndex = 11;
+            linkLabel1.TabStop = true;
+            linkLabel1.Text = "Added calls to Clio (begin with an ampersand):";
+            linkLabel1.LinkClicked += linkLabel1_LinkClicked;
+            // 
+            // txtAddedHtml
+            // 
+            txtAddedHtml.Location = new Point(37, 346);
+            txtAddedHtml.Name = "txtAddedHtml";
+            txtAddedHtml.Size = new Size(334, 23);
+            txtAddedHtml.TabIndex = 10;
+            txtAddedHtml.Text = "&...";
+            txtAddedHtml.TextChanged += Update_Preview;
+            // 
+            // chkCreatedSince
+            // 
+            chkCreatedSince.AutoSize = true;
+            chkCreatedSince.Location = new Point(197, 45);
+            chkCreatedSince.Name = "chkCreatedSince";
+            chkCreatedSince.Size = new Size(101, 19);
+            chkCreatedSince.TabIndex = 9;
+            chkCreatedSince.Text = "Created Since:";
+            chkCreatedSince.UseVisualStyleBackColor = true;
+            chkCreatedSince.CheckedChanged += Update_Preview;
+            // 
+            // monthCalendar1
+            // 
+            monthCalendar1.Location = new Point(197, 67);
+            monthCalendar1.MaxSelectionCount = 1;
+            monthCalendar1.Name = "monthCalendar1";
+            monthCalendar1.TabIndex = 8;
+            monthCalendar1.DateChanged += Update_Preview;
+            // 
+            // clbStatus
+            // 
+            clbStatus.CheckOnClick = true;
+            clbStatus.FormattingEnabled = true;
+            clbStatus.Items.AddRange(new object[] { "open", "closed", "pending" });
+            clbStatus.Location = new Point(15, 67);
+            clbStatus.Name = "clbStatus";
+            clbStatus.Size = new Size(120, 58);
+            clbStatus.TabIndex = 6;
+            clbStatus.SelectedIndexChanged += Update_Preview;
+            // 
+            // btnSearch
+            // 
+            btnSearch.BackColor = Color.FromArgb(244, 247, 250);
+            btnSearch.Font = new Font("Montserrat Black", 9.749999F, FontStyle.Bold, GraphicsUnit.Point, 0);
+            btnSearch.ForeColor = Color.FromArgb(244, 162, 97);
+            btnSearch.Location = new Point(386, 616);
+            btnSearch.Name = "btnSearch";
+            btnSearch.Size = new Size(215, 34);
+            btnSearch.TabIndex = 7;
+            btnSearch.Text = "Search Matters";
+            btnSearch.UseVisualStyleBackColor = false;
+            btnSearch.Click += btnSearch_Click;
+            // 
+            // label4
+            // 
+            label4.AutoSize = true;
+            label4.Location = new Point(21, 37);
+            label4.Name = "label4";
+            label4.Size = new Size(38, 15);
+            label4.TabIndex = 8;
+            label4.Text = "fields:";
+            // 
+            // groupBox3
+            // 
+            groupBox3.Controls.Add(lblAddedHtml);
+            groupBox3.Controls.Add(lblStatus);
+            groupBox3.Controls.Add(lblFields);
+            groupBox3.Controls.Add(label6);
+            groupBox3.Controls.Add(label5);
+            groupBox3.Controls.Add(label4);
+            groupBox3.Location = new Point(3, 439);
+            groupBox3.Name = "groupBox3";
+            groupBox3.Size = new Size(969, 129);
+            groupBox3.TabIndex = 9;
+            groupBox3.TabStop = false;
+            groupBox3.Text = "Current API settings:";
+            // 
+            // lblAddedHtml
+            // 
+            lblAddedHtml.AutoSize = true;
+            lblAddedHtml.Location = new Point(65, 67);
+            lblAddedHtml.Name = "lblAddedHtml";
+            lblAddedHtml.Size = new Size(38, 15);
+            lblAddedHtml.TabIndex = 13;
+            lblAddedHtml.Text = "fields:";
+            // 
+            // lblStatus
+            // 
+            lblStatus.AutoSize = true;
+            lblStatus.Location = new Point(65, 52);
+            lblStatus.Name = "lblStatus";
+            lblStatus.Size = new Size(38, 15);
+            lblStatus.TabIndex = 12;
+            lblStatus.Text = "fields:";
+            // 
+            // lblFields
+            // 
+            lblFields.AutoSize = true;
+            lblFields.Font = new Font("Microsoft Sans Serif", 9F);
+            lblFields.Location = new Point(65, 37);
+            lblFields.Name = "lblFields";
+            lblFields.Size = new Size(39, 15);
+            lblFields.TabIndex = 11;
+            lblFields.Text = "fields:";
+            // 
+            // label6
+            // 
+            label6.AutoSize = true;
+            label6.Location = new Point(21, 67);
+            label6.Name = "label6";
+            label6.Size = new Size(43, 15);
+            label6.TabIndex = 10;
+            label6.Text = "added:";
+            // 
+            // label5
+            // 
+            label5.AutoSize = true;
+            label5.Location = new Point(21, 52);
+            label5.Name = "label5";
+            label5.Size = new Size(41, 15);
+            label5.TabIndex = 9;
+            label5.Text = "status:";
+            // 
+            // MatterQueryControl
+            // 
+            AutoScaleDimensions = new SizeF(7F, 15F);
+            AutoScaleMode = AutoScaleMode.Font;
+            Controls.Add(groupBox3);
+            Controls.Add(btnSearch);
+            Controls.Add(groupBox2);
+            Controls.Add(groupBox1);
+            Name = "MatterQueryControl";
+            Size = new Size(1060, 663);
+            groupBox1.ResumeLayout(false);
+            groupBox1.PerformLayout();
+            groupBox2.ResumeLayout(false);
+            groupBox2.PerformLayout();
+            groupBox3.ResumeLayout(false);
+            groupBox3.PerformLayout();
+            ResumeLayout(false);
+
+        }
+
+
+
+        #endregion
+
+        private CheckedListBox clbMatterFields;
+        private Label label1;
+        private Label label2;
+        private CheckedListBox clbClientFields;
+        private GroupBox groupBox1;
+        private Label label3;
+        private GroupBox groupBox2;
+        private CheckedListBox clbStatus;
+        private CheckBox chkCreatedSince;
+        private MonthCalendar monthCalendar1;
+        private Button btnSearch;
+        private CheckBox chkAddedHtml;
+        private LinkLabel linkLabel1;
+        private TextBox txtAddedHtml;
+        private Label label4;
+        private GroupBox groupBox3;
+        private Label lblAddedHtml;
+        private Label lblStatus;
+        private Label lblFields;
+        private Label label6;
+        private Label label5;
+    }
+}
+
+
+// File: UI\Controls\ProgressBarWithText.cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CalliAPI.UI.Controls
+{
+
+    public class ProgressBarWithText : ProgressBar
+    {
+
+        private int _lastValue = -1; // to avoid redrawing if nothing changed
+
+        Brush amourgishalfblue = new SolidBrush(ColorTranslator.FromHtml("#A2BCD6"));
+        Brush amourgisaccenttext = new SolidBrush(ColorTranslator.FromHtml("#2F5061"));
+
+        public ProgressBarWithText()
+        {
+            this.SetStyle(ControlStyles.UserPaint, true);
+        }
+
+
+        public new int Value
+        {
+            get => base.Value;
+            set
+            {
+                if (value != _lastValue)
+                {
+                    _lastValue = value;
+                    base.Value = value;
+                    this.Invalidate(); // Only redraw when value changes
+                }
+            }
+        }
+
+
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Rectangle rect = this.ClientRectangle;
+            Graphics g = e.Graphics;
+
+            ProgressBarRenderer.DrawHorizontalBar(g, rect);
+            rect.Inflate(-3, -3);
+
+            if (this.Value > 0)
+            {
+                Rectangle clip = new Rectangle(rect.X, rect.Y,
+                (int)(rect.Width * ((double)this.Value / this.Maximum)), rect.Height);
+                g.FillRectangle(amourgishalfblue, clip);
+            }
+
+            string text = $"{this.Value}%";
+            using (Font f = new Font("Cormorant Garamond", 10, FontStyle.Bold))
+            {
+                SizeF len = g.MeasureString(text, f);
+                Point location = new Point((int)((rect.Width - len.Width) / 2),
+                (int)((rect.Height - len.Height) / 2));
+                g.DrawString(text, f, amourgisaccenttext, location);
+            }
+        }
+    }
+
+}
+
+
+// File: UI\Views\FastFetchCreatedSinceView.cs
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using CalliAPI.BusinessLogic;
+using CalliAPI.Interfaces;
+
+namespace CalliAPI.UI.Views
+{
+    public partial class FastFetchCreatedSinceView : UserControl
+    {
+        private ClioService _clioService;
+        private readonly IReportContext _context;
+
+        public FastFetchCreatedSinceView(ClioService clioService, IReportContext context)
+        {
+            _clioService = clioService;
+            _context = context ?? throw new ArgumentNullException(nameof(context));
+            InitializeComponent();
+        }
+
+        private const int MaxLookbackDays = 365; // Maximum lookback period in days
+        public string reportName;
+
+        private void btnLaunch_Click(object sender, EventArgs e)
+        {
+            FastFetchAllMatters();
+        }
+
+        private async Task FastFetchAllMatters()
+        {
+            DateTime selectedDate;
+
+            while (true)
+            {
+                using (var datePicker = new DatePickerDialog(MaxLookbackDays)) // Custom form or use DateTimePicker in a dialog
+                {
+                    if (datePicker.ShowDialog() != DialogResult.OK)
+                        return; // User cancelled
+
+                    selectedDate = datePicker.SelectedDate;
+
+                    if (IsValidLookbackDate(selectedDate))
+                        break;
+
+                    MessageBox.Show($"Please select a date within the last {MaxLookbackDays} days.",
+                    "Invalid Date", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+
+            try
+            {
+                Cursor.Current = Cursors.WaitCursor;
+                reportName = $"Report: All Matters since {selectedDate.ToShortDateString()}";
+                _context.SetReportName(reportName);
+                await _clioService.FastFetchAllMatters(selectedDate);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"An error occurred: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                Cursor.Current = Cursors.Default;
+            }
+        }
+
+        private static bool IsValidLookbackDate(DateTime selectedDate)
+        {
+            var earliestAllowed = DateTime.UtcNow.Date.AddDays(-MaxLookbackDays);
+            return selectedDate >= earliestAllowed;
+        }
+
+        
+
+    }
+}
+
+
+// File: UI\Views\FastFetchCreatedSinceView.Designer.cs
+namespace CalliAPI.UI.Views
+{
+    partial class FastFetchCreatedSinceView
+    {
+        /// <summary> 
+        /// Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary> 
+        /// Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Component Designer generated code
+
+        /// <summary> 
+        /// Required method for Designer support - do not modify 
+        /// the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            richTextBox1 = new RichTextBox();
+            label1 = new Label();
+            btnLaunch = new Button();
+            SuspendLayout();
+            // 
+            // richTextBox1
+            // 
+            richTextBox1.DetectUrls = false;
+            richTextBox1.Location = new Point(14, 56);
+            richTextBox1.Name = "richTextBox1";
+            richTextBox1.ReadOnly = true;
+            richTextBox1.Size = new Size(519, 140);
+            richTextBox1.TabIndex = 14;
+            richTextBox1.Text = "Obtain all of the matters in Clio that have been created since a certain date.\n\nFastFetch is limited to 10,000 records.";
+            // 
+            // label1
+            // 
+            label1.AutoSize = true;
+            label1.Font = new Font("Segoe UI", 18F, FontStyle.Bold, GraphicsUnit.Point, 0);
+            label1.Location = new Point(14, 9);
+            label1.Name = "label1";
+            label1.Size = new Size(302, 32);
+            label1.TabIndex = 13;
+            label1.Text = "All Matters Created Since";
+            // 
+            // btnLaunch
+            // 
+            btnLaunch.Location = new Point(167, 202);
+            btnLaunch.Name = "btnLaunch";
+            btnLaunch.Size = new Size(220, 23);
+            btnLaunch.TabIndex = 12;
+            btnLaunch.Text = "Launch FastFetch Created Since Report";
+            btnLaunch.UseVisualStyleBackColor = true;
+            btnLaunch.Click += btnLaunch_Click;
+            // 
+            // FastFetchCreatedSinceView
+            // 
+            AutoScaleDimensions = new SizeF(7F, 15F);
+            AutoScaleMode = AutoScaleMode.Font;
+            Controls.Add(richTextBox1);
+            Controls.Add(label1);
+            Controls.Add(btnLaunch);
+            Name = "FastFetchCreatedSinceView";
+            Size = new Size(554, 248);
+            ResumeLayout(false);
+            PerformLayout();
+        }
+
+        #endregion
+
+        private RichTextBox richTextBox1;
+        private Label label1;
+        private Button btnLaunch;
+    }
+}
+
+
+// File: UI\Views\ReportsOpenMattersUnworkedMatters.cs
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using CalliAPI.BusinessLogic;
+using CalliAPI.Utilities;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement;
+
+namespace CalliAPI.UI.Views
+{
+    public partial class ReportsOpenMattersUnworkedMatters : UserControl
+    {
+        private KeywordTooltipManager _tooltipManager;
+        private readonly ClioService _clioService;
+
+        public ReportsOpenMattersUnworkedMatters(ClioService clioService)
+        {
+            _clioService = clioService;
+            InitializeComponent();
+            // Initialize the keyword tooltip manager
+            _tooltipManager = new KeywordTooltipManager(richTextBox1, toolTip1, TooltipDefinitions.Keywords);
+            _tooltipManager.HighlightKeywords();
+
+        }
+
+        private async void btnLaunch_Click(object sender, EventArgs e)
+        {
+            await _clioService.GetUnworked713Matters();
+        }
+    }
+}
+
+
+// File: UI\Views\ReportsOpenMattersUnworkedMatters.Designer.cs
+namespace CalliAPI.UI.Views
+{
+    partial class ReportsOpenMattersUnworkedMatters
+    {
+        /// <summary> 
+        /// Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary> 
+        /// Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Component Designer generated code
+
+        /// <summary> 
+        /// Required method for Designer support - do not modify 
+        /// the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            components = new System.ComponentModel.Container();
+            btnLaunch = new Button();
+            label1 = new Label();
+            richTextBox1 = new RichTextBox();
+            toolTip1 = new ToolTip(components);
+            SuspendLayout();
+            // 
+            // btnLaunch
+            // 
+            btnLaunch.Location = new Point(175, 211);
+            btnLaunch.Name = "btnLaunch";
+            btnLaunch.Size = new Size(220, 23);
+            btnLaunch.TabIndex = 0;
+            btnLaunch.Text = "Launch Unworked Matters Report";
+            btnLaunch.UseVisualStyleBackColor = true;
+            btnLaunch.Click += btnLaunch_Click;
+            // 
+            // label1
+            // 
+            label1.AutoSize = true;
+            label1.Font = new Font("Segoe UI", 18F, FontStyle.Bold, GraphicsUnit.Point, 0);
+            label1.Location = new Point(22, 18);
+            label1.Name = "label1";
+            label1.Size = new Size(294, 32);
+            label1.TabIndex = 9;
+            label1.Text = "Open Unworked Matters";
+            // 
+            // richTextBox1
+            // 
+            richTextBox1.DetectUrls = false;
+            richTextBox1.Location = new Point(22, 65);
+            richTextBox1.Name = "richTextBox1";
+            richTextBox1.ReadOnly = true;
+            richTextBox1.Size = new Size(519, 140);
+            richTextBox1.TabIndex = 11;
+            richTextBox1.Text = "Obtain all of the open 713 matters in Clio that are in a prefile stage and unworked (so no tasks are marked as not complete).";
+            // 
+            // ReportsOpenMattersUnworkedMatters
+            // 
+            AutoScaleDimensions = new SizeF(7F, 15F);
+            AutoScaleMode = AutoScaleMode.Font;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            Controls.Add(richTextBox1);
+            Controls.Add(label1);
+            Controls.Add(btnLaunch);
+            Name = "ReportsOpenMattersUnworkedMatters";
+            Size = new Size(544, 237);
+            ResumeLayout(false);
+            PerformLayout();
+        }
+
+        #endregion
+
+        private Button btnLaunch;
+        private Label label1;
+        private RichTextBox richTextBox1;
+        private ToolTip toolTip1;
+    }
+}
+
+
+// File: UI\Views\ReportsView.cs
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace CalliAPI.UI.Views
+{
+    public partial class ReportsView : UserControl
+    {
+        public ReportsView()
+        {
+            InitializeComponent();
+        }
+    }
+}
+
+
+// File: UI\Views\ReportsView.Designer.cs
+namespace CalliAPI.UI.Views
+{
+    partial class ReportsView
+    {
+        /// <summary> 
+        /// Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary> 
+        /// Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Component Designer generated code
+
+        /// <summary> 
+        /// Required method for Designer support - do not modify 
+        /// the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            System.ComponentModel.ComponentResourceManager resources = new System.ComponentModel.ComponentResourceManager(typeof(ReportsView));
+            label1 = new Label();
+            textBox1 = new TextBox();
+            SuspendLayout();
+            // 
+            // label1
+            // 
+            label1.AutoSize = true;
+            label1.Font = new Font("Segoe UI", 18F, FontStyle.Bold, GraphicsUnit.Point, 0);
+            label1.Location = new Point(23, 11);
+            label1.Name = "label1";
+            label1.Size = new Size(103, 32);
+            label1.TabIndex = 0;
+            label1.Text = "Reports";
+            // 
+            // textBox1
+            // 
+            textBox1.BorderStyle = BorderStyle.None;
+            textBox1.Font = new Font("Segoe UI", 9F, FontStyle.Italic);
+            textBox1.ForeColor = SystemColors.ControlDark;
+            textBox1.Location = new Point(23, 83);
+            textBox1.Multiline = true;
+            textBox1.Name = "textBox1";
+            textBox1.ReadOnly = true;
+            textBox1.Size = new Size(519, 122);
+            textBox1.TabIndex = 8;
+            textBox1.Text = resources.GetString("textBox1.Text");
+            // 
+            // ReportsView
+            // 
+            AutoScaleDimensions = new SizeF(7F, 15F);
+            AutoScaleMode = AutoScaleMode.Font;
+            Controls.Add(textBox1);
+            Controls.Add(label1);
+            Name = "ReportsView";
+            Size = new Size(572, 437);
+            ResumeLayout(false);
+            PerformLayout();
+        }
+
+        #endregion
+
+        private Label label1;
+        private TextBox textBox1;
+    }
+}
+
+

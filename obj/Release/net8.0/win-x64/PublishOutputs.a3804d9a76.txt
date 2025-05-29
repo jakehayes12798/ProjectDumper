@@ -1,0 +1,2 @@
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\bin\Release\net8.0\win-x64\publish\ProjectDumper.pdb
+C:\Users\JakeH.AMOURGISREILLY\source\repos\ProjectDumper\bin\Release\net8.0\win-x64\publish\ProjectDumper.exe
