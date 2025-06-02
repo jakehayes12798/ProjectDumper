@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("ProjectDumper")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+4cb616ef0bc9316b45eeafcef0d39b4659524b2a")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+b2db074dd02a1aad5807f9db11cf089295ef0485")]
 [assembly: System.Reflection.AssemblyProductAttribute("ProjectDumper")]
 [assembly: System.Reflection.AssemblyTitleAttribute("ProjectDumper")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
