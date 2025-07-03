@@ -1,0 +1,15 @@
+{
+  "profiles": {
+    "ProjectDumper": {
+      "commandName": "Project"
+    },
+    "C:\\Users\\JakeH.AMOURGISREILLY\\Documents\\GitHub\\LeadsManagerCORE": {
+      "commandName": "Project",
+      "commandLineArgs": "C:\\Users\\JakeH.AMOURGISREILLY\\Documents\\GitHub\\LeadsManagerCORE"
+    },
+    "C:\\Users\\JakeH.AMOURGISREILLY\\Documents\\GitHub\\CalliAPICORE": {
+      "commandName": "Project",
+      "commandLineArgs": "C:\\Users\\JakeH.AMOURGISREILLY\\Documents\\GitHub\\CalliAPICORE"
+    }
+  }
+}
