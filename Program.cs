@@ -1,19 +1,27 @@
-﻿using System;
-using System.IO;
-using System.Linq;
-using System.Collections.Generic;
-
-class Program
+﻿class Program
 {
     static void Main(string[] args)
     {
+        string projectDir;
+
         if (args.Length < 1)
         {
             Console.WriteLine("Usage: ProjectFileDumper <project-directory> [output-file]");
-            return;
+            Console.WriteLine("Enter the full path to the project directory and optionally an output file name.");
+            projectDir = Console.ReadLine()?.Trim();
+            projectDir = projectDir.Replace("\"", ""); // Remove quotes if any
+            if (string.IsNullOrWhiteSpace(projectDir) || !Directory.Exists(projectDir))
+            {
+                Console.WriteLine("Invalid project directory. Please provide a valid path.");
+                return;
+            }
+        }
+        else
+        {
+            projectDir = args[0];
         }
 
-        string projectDir = args[0];
+
 
         string outputFile = args.Length > 1 && !string.IsNullOrWhiteSpace(args[1])
             ? args[1]
@@ -90,5 +98,7 @@ class Program
         Console.WriteLine($"Files skipped by extension: {skippedByExtension}");
         Console.WriteLine($"Files included in output: {includedFiles}");
         Console.WriteLine($"Project files dumped from {projectDir} to {outputFile}");
+
+        Console.ReadKey(); // Wait for user input before closing
     }
 }
