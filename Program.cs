@@ -31,21 +31,51 @@
         string defaultExcludes = ".git,.github,.vs,bin,docs,obj,releases,publish,resources";
         Console.WriteLine("Enter folders to exclude (comma-separated, e.g., bin,obj,.vs)");
         Console.WriteLine($"Default: {defaultExcludes}");
+        Console.WriteLine("Note: Folders should be separated with a comma. Begin the line with '+' to include all the default folder exclusions:");
         string excludeInput = Console.ReadLine();
+
+        // Process the exclude input
+        if (excludeInput?.Trim().StartsWith("+") == true)
+        {
+            excludeInput = defaultExcludes + "," + excludeInput.TrimStart('+').Trim();
+        }
+
         var excludeFolders = (string.IsNullOrWhiteSpace(excludeInput) ? defaultExcludes : excludeInput)
             .Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Select(f => f.Trim())
             .ToList();
 
+
+        Console.WriteLine($"Excluding folders:");
+        foreach (var folder in excludeFolders)
+        {
+            Console.WriteLine($"- {folder}");
+        }
+
+
         // Prompt for file extensions to skip
         string defaultSkipExts = ".dll,.exe,.png,.jpg,.jpeg,.gif,.zip,.pdb,.user,.pfx,.ico,.ttf,.otf,.woff,.woff2,.svg,.mp4,.mp3,.wav,.bmp,.resx";
         Console.WriteLine("Enter file extensions to skip (comma-separated, e.g., .dll,.exe)");
         Console.WriteLine($"Default: {defaultSkipExts}");
+        Console.WriteLine("Note: Extensions should start with a dot and be separated by a comma. Begin the line with '+' to include all the default skip extensions:");
         string skipExtInput = Console.ReadLine();
+
+        // Process the skip extensions input
+        if (skipExtInput?.Trim().StartsWith("+") == true)
+        {
+            skipExtInput = defaultSkipExts + "," + skipExtInput.TrimStart('+').Trim();
+        }
+
         var skipExtensions = (string.IsNullOrWhiteSpace(skipExtInput) ? defaultSkipExts : skipExtInput)
             .Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Select(ext => ext.Trim().StartsWith('.') ? ext.Trim() : "." + ext.Trim())
             .ToList();
+
+        Console.WriteLine($"Excluding extensions:");
+        foreach (var ext in skipExtensions)
+        {
+            Console.WriteLine($"- {ext}");
+        }
 
         var includeFolders = new List<string>(); // Optional: folders to include
 

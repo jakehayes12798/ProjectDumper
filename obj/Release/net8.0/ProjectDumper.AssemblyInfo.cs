@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("ProjectDumper")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+4934834802d7ff5ff43bb0d3288f769c8955e035")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f07bd941a260350e2a2907a05dfafe2795463bf2")]
 [assembly: System.Reflection.AssemblyProductAttribute("ProjectDumper")]
 [assembly: System.Reflection.AssemblyTitleAttribute("ProjectDumper")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
