@@ -4,6 +4,6 @@
     <DebuggerFlavor>ProjectDebugger</DebuggerFlavor>
   </PropertyGroup>
   <PropertyGroup>
-    <ActiveDebugProfile>C:\Users\JakeH.AMOURGISREILLY\Documents\GitHub\CalliAPICORE</ActiveDebugProfile>
+    <ActiveDebugProfile>ProjectDumper</ActiveDebugProfile>
   </PropertyGroup>
 </Project>

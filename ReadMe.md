@@ -1,0 +1,1 @@
+Use the \bin\...\-windows releases to get a windows form fallback, allowing you to just double click the exe to run it.

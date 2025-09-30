@@ -1,27 +1,37 @@
-﻿class Program
+﻿using System.Diagnostics;
+
+internal class Program
 {
-    static void Main(string[] args)
+    [STAThread]
+    private static void Main(string[] args)
     {
         string projectDir;
 
-        if (args.Length < 1)
+        if (args.Length == 0)
         {
-            Console.WriteLine("Usage: ProjectFileDumper <project-directory> [output-file]");
-            Console.WriteLine("Enter the full path to the project directory and optionally an output file name.");
-            projectDir = Console.ReadLine()?.Trim();
-            projectDir = projectDir.Replace("\"", ""); // Remove quotes if any
-            if (string.IsNullOrWhiteSpace(projectDir) || !Directory.Exists(projectDir))
+            using (var dialog = new FolderBrowserDialog())
             {
-                Console.WriteLine("Invalid project directory. Please provide a valid path.");
-                return;
+                dialog.Description = "Select a folder";
+                dialog.UseDescriptionForTitle = true;
+
+                DialogResult result = dialog.ShowDialog();
+
+                if (result == DialogResult.OK && !string.IsNullOrWhiteSpace(dialog.SelectedPath))
+                {
+                    projectDir = dialog.SelectedPath;
+                    Console.WriteLine("Selected folder: " + projectDir);
+                }
+                else
+                {
+                    Console.WriteLine("No folder selected.");
+                    return;
+                }
             }
         }
         else
         {
-            projectDir = args[0];
+            projectDir = args[0].Trim().Replace("\"", "");
         }
-
-
 
         string outputFile = args.Length > 1 && !string.IsNullOrWhiteSpace(args[1])
             ? args[1]
@@ -45,13 +55,11 @@
             .Select(f => f.Trim())
             .ToList();
 
-
         Console.WriteLine($"Excluding folders:");
         foreach (var folder in excludeFolders)
         {
             Console.WriteLine($"- {folder}");
         }
-
 
         // Prompt for file extensions to skip
         string defaultSkipExts = ".dll,.exe,.png,.jpg,.jpeg,.gif,.zip,.pdb,.user,.pfx,.ico,.ttf,.otf,.woff,.woff2,.svg,.mp4,.mp3,.wav,.bmp,.resx";
@@ -84,6 +92,7 @@
         int skippedByFolder = 0;
         int skippedByExtension = 0;
         int includedFiles = 0;
+        int erroredFiles = 0;
 
         using var writer = new StreamWriter(outputFile);
 
@@ -114,11 +123,24 @@
                 continue;
             }
 
-            Console.WriteLine($"Processing file: {relativePath}");
-            writer.WriteLine($"// File: {relativePath}");
-            writer.WriteLine(File.ReadAllText(file));
-            writer.WriteLine();
-            includedFiles++;
+            try
+            {
+                Console.WriteLine($"Processing file: {relativePath}");
+                writer.WriteLine($"// File: {relativePath}");
+                writer.WriteLine(File.ReadAllText(file));
+                writer.WriteLine();
+                includedFiles++;
+            }
+            catch (IOException ex)
+            {
+                Console.WriteLine($"WARNING: Could not read file '{relativePath}' due to IO error: {ex.Message}");
+                erroredFiles++;
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                Console.WriteLine($"WARNING: Access denied to file '{relativePath}': {ex.Message}");
+                erroredFiles++;
+            }
         }
 
         // Summary
@@ -127,8 +149,15 @@
         Console.WriteLine($"Files skipped by folder: {skippedByFolder}");
         Console.WriteLine($"Files skipped by extension: {skippedByExtension}");
         Console.WriteLine($"Files included in output: {includedFiles}");
+        Console.WriteLine($"Files skipped due to errors: {erroredFiles}");
         Console.WriteLine($"Project files dumped from {projectDir} to {outputFile}");
 
-        Console.ReadKey(); // Wait for user input before closing
+        // Open File Explorer with the file selected
+        System.Diagnostics.Process.Start(new ProcessStartInfo
+        {
+            FileName = "explorer.exe",
+            Arguments = $"/select,\"{outputFile}\"",
+            UseShellExecute = true
+        });
     }
 }
