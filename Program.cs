@@ -9,6 +9,9 @@ internal class Program
 
         if (args.Length == 0)
         {
+            // Open a folder browser dialog to select the project directory
+            Console.WriteLine("Please wait, opening folder selection dialog...");
+
             using (var dialog = new FolderBrowserDialog())
             {
                 dialog.Description = "Select a folder";
@@ -144,13 +147,15 @@ internal class Program
         }
 
         // Summary
-        Console.WriteLine("\n--- Summary ---");
+        Console.WriteLine("\n       ---=== Summary ===---");
         Console.WriteLine($"Total files scanned: {totalFiles}");
         Console.WriteLine($"Files skipped by folder: {skippedByFolder}");
         Console.WriteLine($"Files skipped by extension: {skippedByExtension}");
         Console.WriteLine($"Files included in output: {includedFiles}");
         Console.WriteLine($"Files skipped due to errors: {erroredFiles}");
         Console.WriteLine($"Project files dumped from {projectDir} to {outputFile}");
+
+        Console.WriteLine("Opening output now, please wait...");
 
         // Open File Explorer with the file selected
         System.Diagnostics.Process.Start(new ProcessStartInfo
@@ -159,5 +164,8 @@ internal class Program
             Arguments = $"/select,\"{outputFile}\"",
             UseShellExecute = true
         });
+
+        // Pause before exit
+        Console.WriteLine("Press any key to exit ... ");
     }
 }
